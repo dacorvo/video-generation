@@ -6,7 +6,7 @@ one torch.distributed rank per core, and torch.compile(backend="neuron") compile
 on CPU. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
-models/ and outputs/ are in the working directory of the demo, `launch.WORK_DIR`.
+outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
 
 Run with:
     ./run.sh generate.py [--cpu] [--prompt PROMPT] [--seed SEED] [--name NAME]
@@ -21,7 +21,8 @@ import time
 import launch
 
 MODEL_DIR = os.path.join(launch.WORK_DIR, "models", "LTX-2.5-Diffusers")
-OUTPUT_DIR = os.path.join(launch.WORK_DIR, "outputs")
+# Unlike the weights, the clips are small: they stay in the repository, where the editor shows them.
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 TP = 2
 RANK = int(os.environ.get("RANK", "0"))
 # 2 seconds at 768x512: LTX-2.5 takes one frame more than a multiple of 8.

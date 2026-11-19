@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 # The working directory of the demo, which .env sets (see setup.sh). It holds
-# the venv, the weights, the NEFF cache and the clips.
+# the venv, the weights and the NEFF cache.
 WORK_DIR = os.environ["WORK_DIR"]
 
 

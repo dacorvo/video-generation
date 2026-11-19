@@ -5,8 +5,8 @@ on a trn3.48xlarge, its transformer split over the NeuronCores.
 
 ## Setup
 
-The demo keeps its venv, the weights, the compiled graphs and the clips in a
-working directory of its own, here `/data/video-gen-demo`. The weights are in
+The demo keeps its venv, the weights and the compiled graphs in a working
+directory of its own, here `/data/video-gen-demo`. The weights are in
 a gated repository: accept its terms at
 [Lightricks/LTX-2.5-Diffusers](https://huggingface.co/Lightricks/LTX-2.5-Diffusers)
 with the account of your Hugging Face token. Then, on a pod started from the
@@ -27,9 +27,9 @@ to `.env`:
 ./run.sh generate.py --cpu   # all on CPU, to compare
 ```
 
-[`generate.py`](generate.py) writes the clip to `outputs/` in the working
-directory: an mp4 with its audio, 4 of its frames as a png, and its frames and
-audio as an npz. `--prompt` and `--seed` set what it generates.
+[`generate.py`](generate.py) writes the clip to `outputs/`: an mp4 with its
+audio, 4 of its frames as a png, and its frames and audio as an npz. `--prompt`
+and `--seed` set what it generates.
 
 ## Checks
 
