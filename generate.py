@@ -117,19 +117,41 @@ def generate(pipe, prompt: str, seed: int):
     )
 
 
+def write_mp4(path: str, frames, audio, sample_rate: int) -> None:
+    """Writes the frames, in uint8 RGB, and the stereo audio of a clip to the mp4 `path`, in H.264 and MP3.
+
+    diffusers' encode_video writes the audio in AAC, which the VS Code preview does not play.
+    """
+    import av
+
+    with av.open(path, mode="w") as container:
+        video_stream = container.add_stream("libx264", rate=int(FPS))
+        video_stream.width, video_stream.height, video_stream.pix_fmt = frames.shape[2], frames.shape[1], "yuv420p"
+        audio_stream = container.add_stream("libmp3lame", rate=sample_rate)
+        audio_stream.codec_context.layout = "stereo"
+        for array in frames:
+            container.mux(video_stream.encode(av.VideoFrame.from_ndarray(array, format="rgb24")))
+        container.mux(video_stream.encode())
+        samples = av.AudioFrame.from_ndarray(audio, format="fltp", layout="stereo")
+        samples.sample_rate = sample_rate
+        samples.pts = 0
+        container.mux(audio_stream.encode(samples))
+        container.mux(audio_stream.encode())
+
+
 def save(video, audio, sample_rate: int, name: str) -> None:
     """Writes the clip to outputs/: NAME.mp4, NAME.png (4 of its frames) and NAME.npz (its frames and audio)."""
     import numpy as np
-    from diffusers.utils import encode_video
     from PIL import Image
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, name)
-    encode_video(video, fps=int(FPS), output_path=f"{path}.mp4", audio=audio, audio_sample_rate=sample_rate)
     frames = (np.clip(video, 0, 1) * 255).round().astype(np.uint8)
+    audio = audio.numpy()
+    write_mp4(f"{path}.mp4", frames, audio, sample_rate)
     picks = np.linspace(0, len(frames) - 1, 4).round().astype(int)
     Image.fromarray(np.concatenate(list(frames[picks]), axis=1)).save(f"{path}.png")
-    np.savez(f"{path}.npz", video=frames, audio=audio.numpy())
+    np.savez(f"{path}.npz", video=frames, audio=audio)
 
 
 def main() -> None:
