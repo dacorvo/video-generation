@@ -20,6 +20,8 @@ from diffusers import LTX2VideoTransformer3DModel, TensorParallelConfig
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.transformers.transformer_ltx2 import apply_split_rotary_emb
 
+import numerics
+
 # The attentions and feed-forwards of each transformer block.
 ATTENTIONS = ("attn1", "attn2", "audio_attn1", "audio_attn2", "audio_to_video_attn", "video_to_audio_attn")
 FEED_FORWARDS = ("ff", "audio_ff")
@@ -118,10 +120,12 @@ class TensorParallelAttnProcessor:
 
 
 def load_transformer(path: str, mesh, dtype: torch.dtype = torch.bfloat16) -> TensorParallelLTX2Transformer:
-    """The LTX-2.5 transformer saved at `path`, in `dtype`, split over the ranks of the 1-D device mesh `mesh`."""
+    """The LTX-2.5 transformer saved at `path`, in `dtype`, split over the ranks of the 1-D device mesh `mesh`, its
+    gelus computed in fp32."""
     # Each rank reads only its slice of each split weight.
     transformer = TensorParallelLTX2Transformer.from_pretrained(
         path, dtype=dtype, parallel_config=TensorParallelConfig(mesh=mesh)
     )
     transformer.set_attn_processor(TensorParallelAttnProcessor(mesh.get_group()))
+    numerics.gelu_in_fp32(transformer)
     return transformer
