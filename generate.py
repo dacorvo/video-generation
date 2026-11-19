@@ -6,9 +6,10 @@ one torch.distributed rank per core, and torch.compile(backend="neuron") compile
 on CPU. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
+models/ and outputs/ are in the working directory of the demo, `launch.WORK_DIR`.
 
 Run with:
-    python generate.py [--cpu] [--prompt PROMPT] [--seed SEED] [--name NAME]
+    ./run.sh generate.py [--cpu] [--prompt PROMPT] [--seed SEED] [--name NAME]
 """
 from __future__ import annotations
 
@@ -19,8 +20,8 @@ import time
 
 import launch
 
-MODEL_DIR = os.path.join(launch.REPO_DIR, "models", "LTX-2.5-Diffusers")
-OUTPUT_DIR = os.path.join(launch.REPO_DIR, "outputs")
+MODEL_DIR = os.path.join(launch.WORK_DIR, "models", "LTX-2.5-Diffusers")
+OUTPUT_DIR = os.path.join(launch.WORK_DIR, "outputs")
 TP = 2
 RANK = int(os.environ.get("RANK", "0"))
 # 2 seconds at 768x512: LTX-2.5 takes one frame more than a multiple of 8.
@@ -156,7 +157,7 @@ def main() -> None:
     if RANK == 0:
         name = args.name or ("cpu" if args.cpu else "neuron")
         save(video[0], audio[0].float().cpu(), pipe.vocoder.config.output_sampling_rate, name)
-        log(f"wrote outputs/{name}.mp4")
+        log(f"wrote {os.path.join(OUTPUT_DIR, name)}.mp4")
 
 
 if __name__ == "__main__":

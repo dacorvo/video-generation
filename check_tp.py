@@ -5,7 +5,7 @@ whole, then split over 2 ranks, on the same inputs, in fp32. The outputs must
 match to fp32 rounding: splitting changes only the order of some sums.
 
 Run with:
-    python check_tp.py
+    ./run.sh check_tp.py
 """
 from __future__ import annotations
 

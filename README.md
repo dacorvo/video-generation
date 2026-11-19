@@ -5,40 +5,35 @@ on a trn3.48xlarge, its transformer split over the NeuronCores.
 
 ## Setup
 
-On a pod started from the AWS Neuron image:
-
-```bash
-./setup.sh
-source .venv/bin/activate
-```
-
-The weights are in a gated repository: accept its terms at
+The demo keeps its venv, the weights, the compiled graphs and the clips in a
+working directory of its own, here `/data/video-gen-demo`. The weights are in
+a gated repository: accept its terms at
 [Lightricks/LTX-2.5-Diffusers](https://huggingface.co/Lightricks/LTX-2.5-Diffusers)
-with the account of your Hugging Face token. The excludes skip what the
-pipeline does not load (82 GB are left):
+with the account of your Hugging Face token. Then, on a pod started from the
+AWS Neuron image, [`setup.sh`](setup.sh) creates the working directory with
+the venv and the weights (82 GB) in it, and writes the path of the directory
+to `.env`:
 
 ```bash
-hf download Lightricks/LTX-2.5-Diffusers --local-dir models/LTX-2.5-Diffusers \
-    --exclude "transformer_full/*" \
-    --exclude "ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
-    --exclude "transformer/*-of-00008.safetensors" \
-    --exclude "connectors/diffusion_pytorch_model.safetensors"
+./setup.sh /data/video-gen-demo
 ```
 
 ## Generate
 
+[`run.sh`](run.sh) runs a script in the venv, with the variables of `.env`:
+
 ```bash
-python generate.py         # transformer on NeuronCores 0 and 1, the other models on CPU
-python generate.py --cpu   # all on CPU, to compare
+./run.sh generate.py         # transformer on NeuronCores 0 and 1, the other models on CPU
+./run.sh generate.py --cpu   # all on CPU, to compare
 ```
 
-[`generate.py`](generate.py) writes the clip to `outputs/`: an mp4 with its audio,
-4 of its frames as a png, and its frames and audio as an npz. `--prompt` and
-`--seed` set what it generates.
+[`generate.py`](generate.py) writes the clip to `outputs/` in the working
+directory: an mp4 with its audio, 4 of its frames as a png, and its frames and
+audio as an npz. `--prompt` and `--seed` set what it generates.
 
 ## Checks
 
 | Command | Checks |
 |---------|--------|
-| `python check_tp.py` | On CPU, that the transformer split over 2 ranks by [`parallel.py`](parallel.py) computes what it computes whole. |
-| `python check_neuron.py` | On NeuronCores 0 and 1, that the transformer split over them computes what it computes on CPU, within the tolerance of the model support sweep. It takes the cores: run it when nothing else uses them. |
+| `./run.sh check_tp.py` | On CPU, that the transformer split over 2 ranks by [`parallel.py`](parallel.py) computes what it computes whole. |
+| `./run.sh check_neuron.py` | On NeuronCores 0 and 1, that the transformer split over them computes what it computes on CPU, within the tolerance of the model support sweep. It takes the cores: run it when nothing else uses them. |

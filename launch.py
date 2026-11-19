@@ -5,14 +5,16 @@ import os
 import subprocess
 import sys
 
-REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+# The working directory of the demo, which .env sets (see setup.sh). It holds
+# the venv, the weights, the NEFF cache and the clips.
+WORK_DIR = os.environ["WORK_DIR"]
 
 
 def set_neuron_environment(cores: int) -> None:
     """Sets the defaults of the Neuron runtime and compiler for a run on `cores` NeuronCores, before torch loads."""
     # The default NEFF cache of the pod is the mount of a public bucket: the
-    # graphs of LTX-2.5 stay on this host.
-    os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_DIR", os.path.join(REPO_DIR, "neff_cache"))
+    # graphs of LTX-2.5 stay in the working directory.
+    os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_DIR", os.path.join(WORK_DIR, "neff_cache"))
     # nki builds its kernels for LNC=1 unless told otherwise, while torch-neuronx
     # compiles for the hardware's LNC (2 on trn3): the first NKI kernel then
     # fails to compile.

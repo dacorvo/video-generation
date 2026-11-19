@@ -6,10 +6,10 @@ rank per core, and torch.compile(backend="neuron") compiles it. It runs on the
 inputs of one denoising step of a 1-second clip at 768x512, and so does the
 whole transformer on CPU, in bf16. As in the model support sweep, the error
 allowed is twice the gap between the CPU outputs in bf16 and in fp32, and at
-least 0.02.
+least 0.02. models/ is in the working directory of the demo, `launch.WORK_DIR`.
 
 Run with:
-    python check_neuron.py
+    ./run.sh check_neuron.py
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import traceback
 
 import launch
 
-TRANSFORMER_DIR = os.path.join(launch.REPO_DIR, "models", "LTX-2.5-Diffusers", "transformer")
+TRANSFORMER_DIR = os.path.join(launch.WORK_DIR, "models", "LTX-2.5-Diffusers", "transformer")
 TP = 2
 RANK = int(os.environ.get("RANK", "0"))
 launch.set_neuron_environment(TP)
