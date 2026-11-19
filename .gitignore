@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+# Model weights, compiled graphs and generated clips.
+models/
+neff_cache/
+outputs/

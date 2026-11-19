@@ -1,0 +1,6 @@
+# The versions the torch-neuronx model support sweep runs diffusers with on
+# this image. diffusers 0.43.0 has the LTX-2.5 pipelines.
+diffusers==0.43.0
+transformers==5.23.0
+# encode_video writes the mp4 with its audio track through PyAV.
+av
