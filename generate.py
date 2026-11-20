@@ -2,9 +2,9 @@
 
 The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. On
 Neuron, `parallel.load_transformer` splits the transformer over the first --tp NeuronCores of NEURON_RT_VISIBLE_CORES,
-one torch.distributed rank per core, and torch.compile(backend="neuron") compiles it. Only rank 0 runs the pipeline,
-its other models on CPU. It sends the arguments of each transformer call to the other ranks, which run their slices
-of the transformer on them. With --cpu, the whole pipeline runs on CPU.
+one torch.distributed rank per core, and torch.compile(backend="neuron") compiles its blocks. Only rank 0 runs the
+pipeline, its other models on CPU. It sends the arguments of each transformer call to the other ranks, which run their
+slices of the transformer on them. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
@@ -40,39 +40,17 @@ def log(msg: str) -> None:
         print(f"[generate] {msg}", flush=True)
 
 
-def without_positions(transformer, kwargs: dict) -> dict:
-    """The arguments of `transformer` without the RoPE positions, which it then computes from the same arguments.
-
-    Computed from num_frames, height, width and fps, the positions are constants: the compiler folds them, and the RoPE
-    with them. Given as inputs, they make the device compute the RoPE inside the graph, and at 960x544 for 10 s on 4
-    NeuronCores that graph returns NaN.
-    """
-    import torch
-
-    cpu = torch.device("cpu")
-    batch_size = kwargs["hidden_states"].shape[0]
-    computed = {
-        "video_coords": transformer.rope.prepare_video_coords(
-            batch_size, kwargs["num_frames"], kwargs["height"], kwargs["width"], cpu, fps=kwargs["fps"]
-        ),
-        "audio_coords": transformer.audio_rope.prepare_audio_coords(batch_size, kwargs["audio_num_frames"], cpu),
-    }
-    kwargs = dict(kwargs)
-    for name, positions in computed.items():
-        given = kwargs.pop(name, None)
-        if given is not None and not torch.equal(given.cpu(), positions):
-            raise ValueError(f"{name} differ from the positions the transformer computes")
-    return kwargs
-
-
 def on_neuron(transformer):
-    """The forward of `transformer`, compiled for the NeuronCore of this rank: it takes and returns tensors on the
-    host."""
+    """The forward of `transformer`, its blocks compiled for the NeuronCore of this rank: it takes and returns tensors
+    on the host."""
     import torch
     from torch.utils._pytree import tree_map
 
     device = f"neuron:{torch.neuron.current_device()}"
-    forward = torch.compile(transformer.forward, backend="neuron", fullgraph=False, dynamic=False)
+    # The blocks share one compiled graph, so a new process traces and lowers a single block. The rest of the forward
+    # runs op by op.
+    transformer.compile_repeated_blocks(backend="neuron", fullgraph=True, dynamic=False)
+    forward = transformer.forward
 
     def call(*args, **kwargs):
         args, kwargs = tree_map(lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, (args, kwargs))
@@ -94,7 +72,6 @@ def timed(transformer, calls: list, group=None) -> None:
     def call(*args, **kwargs):
         t0 = time.time()
         if group is not None:
-            kwargs = without_positions(transformer, kwargs)
             dist.broadcast_object_list([(args, kwargs)], src=0, group=group)
         output = forward(*args, **kwargs)
         calls.append(time.time() - t0)

@@ -2,9 +2,9 @@
 
 `parallel.load_transformer` splits the transformer of models/LTX-2.5-Diffusers
 over the first 2 NeuronCores of NEURON_RT_VISIBLE_CORES, one torch.distributed
-rank per core, and torch.compile(backend="neuron") compiles it. It runs on the
-inputs of one denoising step of a 1-second clip at 768x512, and so does the
-whole transformer on CPU, in bf16. As in the model support sweep, the error
+rank per core, and torch.compile(backend="neuron") compiles its blocks. It runs
+on the inputs of one denoising step of a 1-second clip at 768x512, and so does
+the whole transformer on CPU, in bf16. As in the model support sweep, the error
 allowed is twice the gap between the CPU outputs in bf16 and in fp32, and at
 least 0.02. models/ is in the working directory of the demo, `launch.WORK_DIR`.
 
@@ -94,7 +94,7 @@ def run() -> int:
         t0 = time.time()
         transformer = parallel.load_transformer(TRANSFORMER_DIR, mesh)
         banner(f"load: {time.time() - t0:.0f} s")
-        transformer.compile(backend="neuron", fullgraph=False, dynamic=False)
+        transformer.compile_repeated_blocks(backend="neuron", fullgraph=True, dynamic=False)
         args = moved(inputs(transformer.config, torch.bfloat16), device)
         with torch.no_grad():
             for call in ("first call, which compiles", "second call"):
