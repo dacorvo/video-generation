@@ -1,4 +1,5 @@
-"""Tensor parallelism for the LTX-2.5 transformer of diffusers.
+"""How the LTX-2.5 models of diffusers split over the ranks of a group: the
+transformer by tensor parallelism, the decoder of the video VAE by frames.
 
 diffusers splits a model over the ranks of a tensor-parallel group as it loads
 it, when the model's class has a `_tp_plan`. `LTX2VideoTransformer3DModel` has
@@ -10,14 +11,26 @@ feed-forwards the same way.
 The attention processor of diffusers cannot run on a slice of the heads: it
 normalizes queries and keys over all heads, and reshapes them by the full head
 count. `TensorParallelAttnProcessor` runs in its place.
+
+With the decoder split by frames, each rank decodes a contiguous range of the
+latent frames. The decoder's temporal convolutions (kernel 3, stride 1) pad
+time with one frame on each side, which they repeat from the edges of the
+clip: a rank takes those frames from its neighbors instead, which all ranks
+exchange by an all-gather of their first and last frames, and only the first
+and last ranks repeat their own. Its temporal upsamplers drop the first frame
+they make, which only the first rank does. Each rank then decodes exactly its
+frames of the whole decode.
 """
 from __future__ import annotations
+
+import types
 
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from diffusers import LTX2VideoTransformer3DModel, TensorParallelConfig
 from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.autoencoders.autoencoder_kl_ltx2 import LTX2VideoCausalConv3d, LTX2VideoUpsampler3d
 from diffusers.models.transformers.transformer_ltx2 import apply_split_rotary_emb
 
 import numerics
@@ -129,3 +142,67 @@ def load_transformer(path: str, mesh, dtype: torch.dtype = torch.bfloat16) -> Te
     transformer.set_attn_processor(TensorParallelAttnProcessor(mesh.get_group()))
     numerics.gelu_in_fp32(transformer)
     return transformer
+
+
+def frame_ranges(num_frames: int, world_size: int) -> list[tuple[int, int]]:
+    """The [start, end) latent frames of each rank, as even as possible, the longer ranges first."""
+    size, extra = divmod(num_frames, world_size)
+    starts = [rank * size + min(rank, extra) for rank in range(world_size + 1)]
+    return list(zip(starts[:-1], starts[1:]))
+
+
+def _frame_split_conv_forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
+    """`LTX2VideoCausalConv3d.forward`, its time padding taken from the neighboring ranks when it is not causal."""
+    if causal:
+        return LTX2VideoCausalConv3d.forward(self, hidden_states, causal=causal)
+    group, rank, world_size = self.frame_split
+    first, last = hidden_states[:, :, :1], hidden_states[:, :, -1:]
+    # The first and last frames of each rank, in rank order.
+    edges = funcol.all_gather_tensor(torch.cat([first, last], dim=2).contiguous(), gather_dim=2, group=group)
+    left = edges[:, :, 2 * rank - 1 : 2 * rank] if rank > 0 else first
+    right = edges[:, :, 2 * rank + 2 : 2 * rank + 3] if rank < world_size - 1 else last
+    return self.conv(torch.cat([left, hidden_states, right], dim=2))
+
+
+def _frame_split_upsampler_forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
+    """`LTX2VideoUpsampler3d.forward`, which drops the first frames it makes on the first rank only."""
+    _, rank, _ = self.frame_split
+    drop = self.stride[0] - 1 if rank == 0 else 0
+    batch_size, num_channels, num_frames, height, width = hidden_states.shape
+    if self.residual:
+        residual = hidden_states.reshape(
+            batch_size, -1, self.stride[0], self.stride[1], self.stride[2], num_frames, height, width
+        )
+        residual = residual.permute(0, 1, 5, 2, 6, 3, 7, 4).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        repeats = (self.stride[0] * self.stride[1] * self.stride[2]) // self.upscale_factor
+        residual = residual.repeat(1, repeats, 1, 1, 1)[:, :, drop:]
+    hidden_states = self.conv(hidden_states, causal=causal)
+    hidden_states = hidden_states.reshape(
+        batch_size, -1, self.stride[0], self.stride[1], self.stride[2], num_frames, height, width
+    )
+    hidden_states = hidden_states.permute(0, 1, 5, 2, 6, 3, 7, 4).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+    hidden_states = hidden_states[:, :, drop:]
+    if self.residual:
+        hidden_states = hidden_states + residual
+    return hidden_states
+
+
+def split_by_frames(vae, group: dist.ProcessGroup) -> None:
+    """Makes the video VAE `vae` decode, from the latents of a whole clip, the frames of this rank of `group`."""
+    rank, world_size = dist.get_rank(group), dist.get_world_size(group)
+    for module in vae.decoder.modules():
+        if isinstance(module, LTX2VideoCausalConv3d):
+            if module.kernel_size[0] != 3 or module.conv.stride[0] != 1 or module.conv.dilation[0] != 1:
+                raise NotImplementedError(f"time kernel {module.kernel_size[0]}, stride {module.conv.stride[0]}")
+            module.frame_split = (group, rank, world_size)
+            module.forward = types.MethodType(_frame_split_conv_forward, module)
+        elif isinstance(module, LTX2VideoUpsampler3d):
+            module.frame_split = (group, rank, world_size)
+            module.forward = types.MethodType(_frame_split_upsampler_forward, module)
+    decode = vae.decode
+
+    def decode_frames(latents: torch.Tensor, *args, **kwargs):
+        start, end = frame_ranges(latents.shape[2], world_size)[rank]
+        return decode(latents[:, :, start:end], *args, **kwargs)
+
+    vae.decode = decode_frames

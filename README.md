@@ -23,7 +23,7 @@ to `.env`:
 [`run.sh`](run.sh) runs a script in the venv, with the variables of `.env`:
 
 ```bash
-./run.sh generate.py         # transformer on NeuronCores 0 and 1, the other models on CPU
+./run.sh generate.py         # transformer and video decoder on NeuronCores 0 and 1, the other models on CPU
 ./run.sh generate.py --cpu   # all on CPU, to compare
 ```
 
@@ -36,4 +36,5 @@ and `--seed` set what it generates.
 | Command | Checks |
 |---------|--------|
 | `./run.sh check_tp.py` | On CPU, that the transformer split over 2 ranks by [`parallel.py`](parallel.py) computes what it computes whole. |
+| `./run.sh check_frame_split.py` | On CPU, that the video VAE split by frames over 4 ranks by [`parallel.py`](parallel.py) decodes what it decodes whole. |
 | `./run.sh check_neuron.py` | On NeuronCores 0 and 1, that the transformer split over them computes what it computes on CPU, within the tolerance of the model support sweep. It takes the cores: run it when nothing else uses them. |

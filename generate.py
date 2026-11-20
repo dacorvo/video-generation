@@ -1,10 +1,11 @@
 """Generates a clip with its audio with LTX-2.5, its transformer split over NeuronCores, or all on CPU.
 
 The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. On
-Neuron, `parallel.load_transformer` splits the transformer over the first --tp NeuronCores of NEURON_RT_VISIBLE_CORES,
-one torch.distributed rank per core, and torch.compile(backend="neuron") compiles its blocks. Only rank 0 runs the
-pipeline, its other models on CPU. It sends the arguments of each transformer call to the other ranks, which run their
-slices of the transformer on them. With --cpu, the whole pipeline runs on CPU.
+Neuron, `parallel` splits the transformer, and the decoder of the video VAE by frames, over the first --tp NeuronCores
+of NEURON_RT_VISIBLE_CORES, one torch.distributed rank per core, and torch.compile(backend="neuron") compiles the
+transformer's blocks and the decoder. Only rank 0 runs the pipeline, its other models on CPU. It sends the arguments of
+each transformer call and of the decode to the other ranks, which run their slices of the transformer on them and
+decode their frames, which rank 0 gathers. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
@@ -59,6 +60,40 @@ def on_neuron(transformer):
     return call
 
 
+def decode_on_neuron(vae):
+    """The decode of the video VAE `vae`, its decoder compiled for the NeuronCore of this rank: it takes latents on the
+    host and returns the frames it decodes on the host."""
+    import torch
+
+    device = f"neuron:{torch.neuron.current_device()}"
+    vae.decoder.compile(backend="neuron", fullgraph=True, dynamic=False)
+    decode = vae.decode
+
+    def call(latents, *args, **kwargs):
+        with torch.no_grad():
+            return decode(latents.to(device), *args, **kwargs)[0].cpu()
+
+    return call
+
+
+def split_decode(vae, group) -> None:
+    """Makes the video VAE `vae`, split by frames over the NeuronCores of the ranks of the gloo group `group`, decode its
+    frames on the core of this rank, after it sends the arguments of the decode to the other ranks, which decode theirs
+    (`serve`), then gather them. Its decode returns a tuple, as with `return_dict=False`."""
+    import torch
+    import torch.distributed as dist
+
+    decode = decode_on_neuron(vae)
+
+    def call(*args, **kwargs):
+        dist.broadcast_object_list([("decode", args, kwargs)], src=0, group=group)
+        frames = [None] * dist.get_world_size(group)
+        dist.gather_object(decode(*args, **kwargs), frames, dst=0, group=group)
+        return (torch.cat(frames, dim=2),)
+
+    vae.decode = call
+
+
 def timed(transformer, calls: list, group=None) -> None:
     """Makes `transformer` append the duration of each of its calls to `calls`.
 
@@ -72,7 +107,7 @@ def timed(transformer, calls: list, group=None) -> None:
     def call(*args, **kwargs):
         t0 = time.time()
         if group is not None:
-            dist.broadcast_object_list([(args, kwargs)], src=0, group=group)
+            dist.broadcast_object_list([("transformer", args, kwargs)], src=0, group=group)
         output = forward(*args, **kwargs)
         calls.append(time.time() - t0)
         return output
@@ -80,29 +115,37 @@ def timed(transformer, calls: list, group=None) -> None:
     transformer.forward = call
 
 
-def serve(transformer, group) -> None:
-    """Runs the slice of `transformer` of this rank on the arguments of each call that rank 0 sends over `group`
-    (see `timed`), until it sends None."""
+def serve(transformer, vae, group) -> None:
+    """Runs on the NeuronCore of this rank, on the arguments that rank 0 sends over `group`, the slice of `transformer`
+    of this rank for each transformer call (see `timed`), and the decoder of `vae` on the frames of this rank for each
+    decode, which it then sends to rank 0 (see `split_decode`), until it sends None."""
     import torch
     import torch.distributed as dist
 
     forward = on_neuron(transformer)
+    decode = decode_on_neuron(vae)
     while True:
         message = [None]
         dist.broadcast_object_list(message, src=0, group=group)
         if message[0] is None:
             return
-        args, kwargs = message[0]
+        kind, args, kwargs = message[0]
+        if kind == "decode":
+            dist.gather_object(decode(*args, **kwargs), None, dst=0, group=group)
+            continue
         # Without grad, as the pipeline runs on rank 0: with grad, this rank would compile another graph, which keeps
         # the activations for a backward pass.
         with torch.no_grad():
             forward(*args, **kwargs)
 
 
-def load_transformer():
-    """The slice of the LTX-2.5 transformer of this rank, split over the NeuronCores of all ranks, and a gloo group of
-    all ranks, which sends the arguments of its calls."""
+def load_models():
+    """The slice of the LTX-2.5 transformer of this rank, and the video VAE, its decoder on the NeuronCore of this rank,
+    both split over the NeuronCores of all ranks, and a gloo group of all ranks, which sends the arguments of their
+    calls."""
+    import torch
     import torch.distributed as dist
+    from diffusers import AutoencoderKLLTX2Video
     from torch.distributed.device_mesh import DeviceMesh
 
     import parallel
@@ -110,12 +153,16 @@ def load_transformer():
     dist.init_process_group(backend="neuron")
     mesh = DeviceMesh("neuron", list(range(dist.get_world_size())))
     transformer = parallel.load_transformer(os.path.join(MODEL_DIR, "transformer"), mesh)
-    return transformer, dist.new_group(backend="gloo")
+    vae = AutoencoderKLLTX2Video.from_pretrained(os.path.join(MODEL_DIR, "vae"), dtype=torch.bfloat16)
+    # The pipeline normalizes the latents on the host with the other tensors of the VAE.
+    vae.decoder.to(f"neuron:{torch.neuron.current_device()}")
+    parallel.split_by_frames(vae, mesh.get_group())
+    return transformer, vae, dist.new_group(backend="gloo")
 
 
-def load_pipeline(calls: list, transformer=None, group=None):
-    """The distilled LTX-2.5 pipeline in bf16, its tensors on the host. Its transformer runs on CPU, or is `transformer`
-    on Neuron, with `group`, as `load_transformer` returns them."""
+def load_pipeline(calls: list, transformer=None, vae=None, group=None):
+    """The distilled LTX-2.5 pipeline in bf16, its tensors on the host. Its transformer and video VAE run on CPU, or
+    are `transformer` and `vae` on Neuron, with `group`, as `load_models` returns them."""
     import torch
     from diffusers import LTX2Pipeline
 
@@ -127,12 +174,14 @@ def load_pipeline(calls: list, transformer=None, group=None):
         def _execution_device(self):
             return torch.device("cpu")
 
-    components = {} if transformer is None else {"transformer": transformer}
+    components = {} if transformer is None else {"transformer": transformer, "vae": vae}
     # The processor and the prompt enhancer serve prompt enhancement only.
     pipe = HostPipeline.from_pretrained(
         MODEL_DIR, dtype=torch.bfloat16, processor=None, prompt_enhancer=None, **components
     )
     timed(pipe.transformer, calls, group)
+    if group is not None:
+        split_decode(pipe.vae, group)
     return pipe
 
 
@@ -208,7 +257,7 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--frames", type=int, default=NUM_FRAMES, help="one more than a multiple of 8")
-    parser.add_argument("--tp", type=int, default=TP, help="the number of NeuronCores the transformer is split over")
+    parser.add_argument("--tp", type=int, default=TP, help="the number of NeuronCores the models are split over")
     args = parser.parse_args()
     if args.cpu:
         # Keeps torch from loading torch-neuronx: this run takes no NeuronCore.
@@ -220,13 +269,13 @@ def main() -> None:
 
     calls = []
     t0 = time.time()
-    transformer = group = None
+    transformer = vae = group = None
     if not args.cpu:
-        transformer, group = load_transformer()
+        transformer, vae, group = load_models()
         if RANK != 0:
-            serve(transformer, group)
+            serve(transformer, vae, group)
             return
-    pipe = load_pipeline(calls, transformer, group)
+    pipe = load_pipeline(calls, transformer, vae, group)
     log(f"load: {time.time() - t0:.0f} s")
     t0 = time.time()
     video, audio = generate(pipe, args.prompt, args.seed, args.width, args.height, args.frames)
