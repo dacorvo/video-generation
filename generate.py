@@ -1,7 +1,7 @@
-"""Generates a clip with its audio with LTX-2.5, its transformer split over 2 NeuronCores, or all on CPU.
+"""Generates a clip with its audio with LTX-2.5, its transformer split over NeuronCores, or all on CPU.
 
 The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. On
-Neuron, `parallel.load_transformer` splits the transformer over the first 2 NeuronCores of NEURON_RT_VISIBLE_CORES,
+Neuron, `parallel.load_transformer` splits the transformer over the first --tp NeuronCores of NEURON_RT_VISIBLE_CORES,
 one torch.distributed rank per core, and torch.compile(backend="neuron") compiles it. Every rank runs the other models
 on CPU. With --cpu, the whole pipeline runs on CPU.
 
@@ -9,7 +9,8 @@ The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its 
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
 
 Run with:
-    ./run.sh generate.py [--cpu] [--prompt PROMPT] [--seed SEED] [--name NAME]
+    ./run.sh generate.py [--cpu] [--prompt PROMPT] [--seed SEED] [--name NAME] [--width WIDTH] [--height HEIGHT]
+        [--frames FRAMES] [--tp TP]
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ MODEL_DIR = os.path.join(launch.WORK_DIR, "models", "LTX-2.5-Diffusers")
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 TP = 2
 RANK = int(os.environ.get("RANK", "0"))
-# 2 seconds at 768x512: LTX-2.5 takes one frame more than a multiple of 8.
+# By default, 2 seconds at 768x512. LTX-2.5 takes one frame more than a multiple of 8.
 WIDTH, HEIGHT, NUM_FRAMES, FPS = 768, 512, 49, 24.0
 PROMPT = (
     "A red fox trots through fresh snow in a sunlit pine forest, its breath steaming in the cold air. The camera "
@@ -90,7 +91,7 @@ def load_pipeline(cpu: bool, calls: list):
     return pipe
 
 
-def generate(pipe, prompt: str, seed: int):
+def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: int):
     """The video, as frames in [0, 1], and the audio of the clip of `prompt`: those of rank 0, latents on the others."""
     import torch
     from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES
@@ -98,9 +99,9 @@ def generate(pipe, prompt: str, seed: int):
     return pipe(
         prompt=prompt,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
-        width=WIDTH,
-        height=HEIGHT,
-        num_frames=NUM_FRAMES,
+        width=width,
+        height=height,
+        num_frames=num_frames,
         frame_rate=FPS,
         sigmas=DISTILLED_SIGMA_VALUES,
         guidance_scale=1.0,
@@ -160,21 +161,25 @@ def main() -> None:
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--name", help="the name of the outputs (default: neuron, or cpu with --cpu)")
+    parser.add_argument("--width", type=int, default=WIDTH)
+    parser.add_argument("--height", type=int, default=HEIGHT)
+    parser.add_argument("--frames", type=int, default=NUM_FRAMES, help="one more than a multiple of 8")
+    parser.add_argument("--tp", type=int, default=TP, help="the number of NeuronCores the transformer is split over")
     args = parser.parse_args()
     if args.cpu:
         # Keeps torch from loading torch-neuronx: this run takes no NeuronCore.
         os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     else:
-        launch.set_neuron_environment(TP)
+        launch.set_neuron_environment(args.tp)
         if "LOCAL_RANK" not in os.environ:
-            raise SystemExit(launch.torchrun(__file__, TP, sys.argv[1:]))
+            raise SystemExit(launch.torchrun(__file__, args.tp, sys.argv[1:]))
 
     calls = []
     t0 = time.time()
     pipe = load_pipeline(args.cpu, calls)
     log(f"load: {time.time() - t0:.0f} s")
     t0 = time.time()
-    video, audio = generate(pipe, args.prompt, args.seed)
+    video, audio = generate(pipe, args.prompt, args.seed, args.width, args.height, args.frames)
     log(f"generation: {time.time() - t0:.0f} s, transformer: first call {calls[0]:.1f} s, "
         f"then {sum(calls[1:]) / max(len(calls) - 1, 1):.2f} s per call over {len(calls) - 1}")
     if RANK == 0:
