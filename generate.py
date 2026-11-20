@@ -39,6 +39,31 @@ def log(msg: str) -> None:
         print(f"[generate] {msg}", flush=True)
 
 
+def without_positions(transformer, kwargs: dict) -> dict:
+    """The arguments of `transformer` without the RoPE positions, which it then computes from the same arguments.
+
+    Computed from num_frames, height, width and fps, the positions are constants: the compiler folds them, and the RoPE
+    with them. Given as inputs, they make the device compute the RoPE inside the graph, and at 960x544 for 10 s on 4
+    NeuronCores that graph returns NaN.
+    """
+    import torch
+
+    cpu = torch.device("cpu")
+    batch_size = kwargs["hidden_states"].shape[0]
+    computed = {
+        "video_coords": transformer.rope.prepare_video_coords(
+            batch_size, kwargs["num_frames"], kwargs["height"], kwargs["width"], cpu, fps=kwargs["fps"]
+        ),
+        "audio_coords": transformer.audio_rope.prepare_audio_coords(batch_size, kwargs["audio_num_frames"], cpu),
+    }
+    kwargs = dict(kwargs)
+    for name, positions in computed.items():
+        given = kwargs.pop(name, None)
+        if given is not None and not torch.equal(given.cpu(), positions):
+            raise ValueError(f"{name} differ from the positions the transformer computes")
+    return kwargs
+
+
 def timed(transformer, calls: list, device: str | None) -> None:
     """Makes `transformer` append the duration of each of its calls to `calls`. On `device` if given, compiled for
     it, it takes and returns tensors on the host."""
@@ -52,6 +77,7 @@ def timed(transformer, calls: list, device: str | None) -> None:
     def call(*args, **kwargs):
         t0 = time.time()
         if device is not None:
+            kwargs = without_positions(transformer, kwargs)
             args, kwargs = tree_map(lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, (args, kwargs))
         output = tree_map(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, forward(*args, **kwargs))
         calls.append(time.time() - t0)
