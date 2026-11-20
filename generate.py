@@ -26,10 +26,13 @@ import launch
 MODEL_DIR = os.path.join(launch.WORK_DIR, "models", "LTX-2.5-Diffusers")
 # Unlike the weights, the clips are small: they stay in the repository, where the editor shows them.
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
-TP = 2
+# On 2 NeuronCores, the transformer ran out of memory at 960x544 for 10 s.
+TP = 4
 RANK = int(os.environ.get("RANK", "0"))
-# By default, 2 seconds at 768x512. LTX-2.5 takes one frame more than a multiple of 8.
-WIDTH, HEIGHT, NUM_FRAMES, FPS = 768, 512, 49, 24.0
+# By default, 10 seconds at 1024x512. LTX-2.5 takes one frame more than a multiple of 8. A frame of 1024x512 has 512
+# video tokens: their count stays a multiple of 128, so torch-neuronx runs the video self-attention with its NKI flash
+# attention kernel.
+WIDTH, HEIGHT, NUM_FRAMES, FPS = 1024, 512, 241, 24.0
 PROMPT = (
     "A red fox trots through fresh snow in a sunlit pine forest, its breath steaming in the cold air. The camera "
     "tracks alongside it at ground level. Snow crunches under its paws and birds sing in the distance."

@@ -23,7 +23,7 @@ to `.env`:
 [`run.sh`](run.sh) runs a script in the venv, with the variables of `.env`:
 
 ```bash
-./run.sh generate.py         # transformer and video decoder on NeuronCores 0 and 1, the other models on CPU
+./run.sh generate.py         # 10 s at 1024x512, transformer and video decoder on NeuronCores 0 to 3, the rest on CPU
 ./run.sh generate.py --cpu   # all on CPU, to compare
 ```
 
