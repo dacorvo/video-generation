@@ -2,8 +2,9 @@
 
 The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. On
 Neuron, `parallel.load_transformer` splits the transformer over the first --tp NeuronCores of NEURON_RT_VISIBLE_CORES,
-one torch.distributed rank per core, and torch.compile(backend="neuron") compiles it. Every rank runs the other models
-on CPU. With --cpu, the whole pipeline runs on CPU.
+one torch.distributed rank per core, and torch.compile(backend="neuron") compiles it. Only rank 0 runs the pipeline,
+its other models on CPU. It sends the arguments of each transformer call to the other ranks, which run their slices
+of the transformer on them. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
@@ -64,30 +65,80 @@ def without_positions(transformer, kwargs: dict) -> dict:
     return kwargs
 
 
-def timed(transformer, calls: list, device: str | None) -> None:
-    """Makes `transformer` append the duration of each of its calls to `calls`. On `device` if given, compiled for
-    it, it takes and returns tensors on the host."""
+def on_neuron(transformer):
+    """The forward of `transformer`, compiled for the NeuronCore of this rank: it takes and returns tensors on the
+    host."""
     import torch
     from torch.utils._pytree import tree_map
 
-    forward = transformer.forward
-    if device is not None:
-        forward = torch.compile(forward, backend="neuron", fullgraph=False, dynamic=False)
+    device = f"neuron:{torch.neuron.current_device()}"
+    forward = torch.compile(transformer.forward, backend="neuron", fullgraph=False, dynamic=False)
+
+    def call(*args, **kwargs):
+        args, kwargs = tree_map(lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, (args, kwargs))
+        return tree_map(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, forward(*args, **kwargs))
+
+    return call
+
+
+def timed(transformer, calls: list, group=None) -> None:
+    """Makes `transformer` append the duration of each of its calls to `calls`.
+
+    With `group`, the gloo group of the ranks that split `transformer` over their NeuronCores, it runs on the core of
+    this rank, after it sends the arguments of the call to the other ranks, which run their slices on them (`serve`).
+    """
+    import torch.distributed as dist
+
+    forward = transformer.forward if group is None else on_neuron(transformer)
 
     def call(*args, **kwargs):
         t0 = time.time()
-        if device is not None:
+        if group is not None:
             kwargs = without_positions(transformer, kwargs)
-            args, kwargs = tree_map(lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, (args, kwargs))
-        output = tree_map(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, forward(*args, **kwargs))
+            dist.broadcast_object_list([(args, kwargs)], src=0, group=group)
+        output = forward(*args, **kwargs)
         calls.append(time.time() - t0)
         return output
 
     transformer.forward = call
 
 
-def load_pipeline(cpu: bool, calls: list):
-    """The distilled LTX-2.5 pipeline in bf16, its tensors on the host, and its transformer on Neuron unless `cpu`."""
+def serve(transformer, group) -> None:
+    """Runs the slice of `transformer` of this rank on the arguments of each call that rank 0 sends over `group`
+    (see `timed`), until it sends None."""
+    import torch
+    import torch.distributed as dist
+
+    forward = on_neuron(transformer)
+    while True:
+        message = [None]
+        dist.broadcast_object_list(message, src=0, group=group)
+        if message[0] is None:
+            return
+        args, kwargs = message[0]
+        # Without grad, as the pipeline runs on rank 0: with grad, this rank would compile another graph, which keeps
+        # the activations for a backward pass.
+        with torch.no_grad():
+            forward(*args, **kwargs)
+
+
+def load_transformer():
+    """The slice of the LTX-2.5 transformer of this rank, split over the NeuronCores of all ranks, and a gloo group of
+    all ranks, which sends the arguments of its calls."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+
+    import parallel
+
+    dist.init_process_group(backend="neuron")
+    mesh = DeviceMesh("neuron", list(range(dist.get_world_size())))
+    transformer = parallel.load_transformer(os.path.join(MODEL_DIR, "transformer"), mesh)
+    return transformer, dist.new_group(backend="gloo")
+
+
+def load_pipeline(calls: list, transformer=None, group=None):
+    """The distilled LTX-2.5 pipeline in bf16, its tensors on the host. Its transformer runs on CPU, or is `transformer`
+    on Neuron, with `group`, as `load_transformer` returns them."""
     import torch
     from diffusers import LTX2Pipeline
 
@@ -99,26 +150,17 @@ def load_pipeline(cpu: bool, calls: list):
         def _execution_device(self):
             return torch.device("cpu")
 
-    components = {}
-    if not cpu:
-        import torch.distributed as dist
-        from torch.distributed.device_mesh import DeviceMesh
-
-        import parallel
-
-        dist.init_process_group(backend="neuron")
-        mesh = DeviceMesh("neuron", list(range(dist.get_world_size())))
-        components["transformer"] = parallel.load_transformer(os.path.join(MODEL_DIR, "transformer"), mesh)
+    components = {} if transformer is None else {"transformer": transformer}
     # The processor and the prompt enhancer serve prompt enhancement only.
     pipe = HostPipeline.from_pretrained(
         MODEL_DIR, dtype=torch.bfloat16, processor=None, prompt_enhancer=None, **components
     )
-    timed(pipe.transformer, calls, None if cpu else f"neuron:{torch.neuron.current_device()}")
+    timed(pipe.transformer, calls, group)
     return pipe
 
 
 def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: int):
-    """The video, as frames in [0, 1], and the audio of the clip of `prompt`: those of rank 0, latents on the others."""
+    """The video, as frames in [0, 1], and the audio of the clip of `prompt`."""
     import torch
     from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES
 
@@ -136,10 +178,9 @@ def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: 
         audio_stg_scale=0.0,
         modality_scale=1.0,
         audio_modality_scale=1.0,
-        # Drawn on the host, the noise is the same on every rank and on CPU.
+        # Drawn on the host, the noise is the same on Neuron and on CPU.
         generator=torch.Generator("cpu").manual_seed(seed),
-        # The ranks run the transformer together, then rank 0 decodes alone.
-        output_type="np" if RANK == 0 else "latent",
+        output_type="np",
         return_dict=False,
     )
 
@@ -202,16 +243,26 @@ def main() -> None:
 
     calls = []
     t0 = time.time()
-    pipe = load_pipeline(args.cpu, calls)
+    transformer = group = None
+    if not args.cpu:
+        transformer, group = load_transformer()
+        if RANK != 0:
+            serve(transformer, group)
+            return
+    pipe = load_pipeline(calls, transformer, group)
     log(f"load: {time.time() - t0:.0f} s")
     t0 = time.time()
     video, audio = generate(pipe, args.prompt, args.seed, args.width, args.height, args.frames)
+    if group is not None:
+        import torch.distributed as dist
+
+        # The other ranks return from `serve`.
+        dist.broadcast_object_list([None], src=0, group=group)
     log(f"generation: {time.time() - t0:.0f} s, transformer: first call {calls[0]:.1f} s, "
         f"then {sum(calls[1:]) / max(len(calls) - 1, 1):.2f} s per call over {len(calls) - 1}")
-    if RANK == 0:
-        name = args.name or ("cpu" if args.cpu else "neuron")
-        save(video[0], audio[0].float().cpu(), pipe.vocoder.config.output_sampling_rate, name)
-        log(f"wrote {os.path.join(OUTPUT_DIR, name)}.mp4")
+    name = args.name or ("cpu" if args.cpu else "neuron")
+    save(video[0], audio[0].float().cpu(), pipe.vocoder.config.output_sampling_rate, name)
+    log(f"wrote {os.path.join(OUTPUT_DIR, name)}.mp4")
 
 
 if __name__ == "__main__":
