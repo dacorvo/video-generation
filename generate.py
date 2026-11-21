@@ -142,6 +142,48 @@ def serve(transformer, vae, group) -> None:
             forward(*args, **kwargs)
 
 
+def pack_parameters(module, alignment: int = 4096, max_buffer: int = 2**30) -> None:
+    """Moves the parameters of `module`, on a NeuronCore, through the host into views of buffers of `max_buffer` bytes.
+
+    torch-neuronx's allocator binds device memory lazily, and as it binds the parameters of a model one by one, it leaves
+    most of the room of the segments it creates for them unused: for the 9.45 GiB of the transformer's slice, it holds
+    22.96 GiB, which `empty_cache` cannot release while the parameters live. In buffers, they take only their size. With
+    one buffer of 9.45 GiB, the runtime fails to load the graphs that have collectives.
+    """
+    import gc
+
+    import torch
+    from torch.distributed.tensor import DTensor
+
+    params = []
+    for name, param in list(module.named_parameters()):
+        local = param.to_local() if isinstance(param, DTensor) else param.data
+        layout = (param.device_mesh, param.placements) if isinstance(param, DTensor) else None
+        params.append((name, local.cpu(), layout, param.requires_grad, local.device))
+        path, _, attr = name.rpartition(".")
+        module.get_submodule(path).register_parameter(attr, None)
+    # Freed before the buffers take their place, the parameters never take room twice on the device.
+    gc.collect()
+    torch.neuron.synchronize()
+    torch.neuron.empty_cache()
+    # The buffer of each parameter, and its offset in it.
+    places, sizes = [], [0]
+    for _, host, *_ in params:
+        size = -(-host.nbytes // alignment) * alignment
+        if sizes[-1] and sizes[-1] + size > max_buffer:
+            sizes.append(0)
+        places.append((len(sizes) - 1, sizes[-1]))
+        sizes[-1] += size
+    buffers = [torch.empty(size, dtype=torch.uint8, device=params[0][4]) for size in sizes]
+    for (name, host, layout, requires_grad, _), (index, offset) in zip(params, places):
+        view = buffers[index][offset : offset + host.nbytes].view(host.dtype).view(host.shape)
+        view.copy_(host)
+        if layout is not None:
+            view = DTensor.from_local(view, *layout, run_check=False)
+        path, _, attr = name.rpartition(".")
+        module.get_submodule(path).register_parameter(attr, torch.nn.Parameter(view, requires_grad=requires_grad))
+
+
 def load_models():
     """The slice of the LTX-2.5 transformer of this rank, and the video VAE, its decoder on the NeuronCore of this rank,
     both split over the NeuronCores of all ranks, and a gloo group of all ranks, which sends the arguments of their
@@ -156,9 +198,11 @@ def load_models():
     dist.init_process_group(backend="neuron")
     mesh = DeviceMesh("neuron", list(range(dist.get_world_size())))
     transformer = parallel.load_transformer(os.path.join(MODEL_DIR, "transformer"), mesh)
+    pack_parameters(transformer)
     vae = AutoencoderKLLTX2Video.from_pretrained(os.path.join(MODEL_DIR, "vae"), dtype=torch.bfloat16)
     # The pipeline normalizes the latents on the host with the other tensors of the VAE.
     vae.decoder.to(f"neuron:{torch.neuron.current_device()}")
+    pack_parameters(vae.decoder)
     parallel.split_by_frames(vae, mesh.get_group())
     return transformer, vae, dist.new_group(backend="gloo")
 
