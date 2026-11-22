@@ -15,11 +15,11 @@ NAME is video-gen-demo-WIDTHxHEIGHT by default, after the size of the clip, with
 the process makes one clip per prompt, one after the other, and their names end with -1, -2...
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
 
-With --film, the process makes the shots of a film, one after the other, then the film, NAME, its shots one after the
-other. A shot can start from the last frames of an earlier shot, which the condition pipeline of diffusers keeps as its
-first frames. From the last frame of a shot, it returns to its subject after a cut. From its last second, it continues
-its motion. The film leaves out those frames, which repeat the earlier shot. NAME is FILM-WIDTHxHEIGHT by default, after
-the file of the film, and the shots are NAME-1, NAME-2...
+With --film, the process makes the shots of a film, NAME-shot-1, NAME-shot-2..., one after the other, then the film,
+NAME-full, its shots one after the other. A shot can start from the last frames of an earlier shot, which the condition
+pipeline of diffusers keeps as its first frames. From the last frame of a shot, it returns to its subject after a cut.
+From its last second, it continues its motion. The film leaves out those frames, which repeat the earlier shot. NAME is
+FILM-WIDTHxHEIGHT by default, after the file of the film.
 
 Run with:
     ./run.sh generate.py [--cpu] [--prompt PROMPT... | --film FILM] [--seed SEED] [--name NAME] [--width WIDTH]
@@ -444,7 +444,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--name", help="the name of the outputs (default: video-gen-demo-WIDTHxHEIGHT, after the size "
                         "of the clip, or FILM-WIDTHxHEIGHT with --film, after its file, with -cpu on CPU), followed by "
-                        "-1, -2... for each of several clips")
+                        "-1, -2... for each of several clips, or by -shot-1, -shot-2... for the shots of a film and "
+                        "-full for the film")
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--frames", type=int, default=NUM_FRAMES, help="one more than a multiple of 8")
@@ -510,13 +511,16 @@ def main() -> None:
         height, width = video[0].shape[1:3]
         stem = os.path.splitext(os.path.basename(args.film))[0] if args.film else "video-gen-demo"
         name = args.name or f"{stem}-{width}x{height}" + ("-cpu" if args.cpu else "")
-        clip_name = f"{name}-{i + 1}" if len(shots) > 1 else name
+        if args.film:
+            clip_name = f"{name}-shot-{i + 1}"
+        else:
+            clip_name = f"{name}-{i + 1}" if len(shots) > 1 else name
         save(*clips[-1], sample_rate, clip_name)
         log(f"wrote {os.path.join(OUTPUT_DIR, clip_name)}.mp4, {time.time() - t0:.0f} s after the start of the clip")
     if args.film:
         t0 = time.time()
-        save(*edit_film(clips, shots, sample_rate), sample_rate, name, npz=False)
-        log(f"wrote {os.path.join(OUTPUT_DIR, name)}.mp4, the film, in {time.time() - t0:.0f} s")
+        save(*edit_film(clips, shots, sample_rate), sample_rate, f"{name}-full", npz=False)
+        log(f"wrote {os.path.join(OUTPUT_DIR, name)}-full.mp4, the film, in {time.time() - t0:.0f} s")
 
 
 if __name__ == "__main__":

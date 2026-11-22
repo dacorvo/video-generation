@@ -46,7 +46,7 @@ after the other in the same process, then the film, its shots edited one after
 the other:
 
 ```bash
-./run.sh generate.py --two-stage --film films/fox.json  # outputs/fox-2048x1024.mp4, and the shots fox-2048x1024-1.mp4...
+./run.sh generate.py --two-stage --film films/fox.json  # outputs/fox-2048x1024-full.mp4, and its shots fox-2048x1024-shot-1.mp4...
 ```
 
 A film is a JSON list of shots, each a prompt. A shot can start from the last
