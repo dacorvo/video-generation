@@ -223,8 +223,10 @@ def split_video_tokens(kwargs: dict, sp_group: dist.ProcessGroup) -> dict:
     if tokens % size:
         raise ValueError(f"{tokens} video tokens do not split over {size} ranks")
     start, end = rank * tokens // size, (rank + 1) * tokens // size
-    return {**kwargs, "hidden_states": kwargs["hidden_states"][:, start:end],
-            "video_coords": kwargs["video_coords"][:, :, start:end]}
+    # The latents of LTX2Pipeline are a transposed view: torch-neuronx takes seconds to copy a slice of them to the
+    # device, and milliseconds once the slice is contiguous.
+    return {**kwargs, "hidden_states": kwargs["hidden_states"][:, start:end].contiguous(),
+            "video_coords": kwargs["video_coords"][:, :, start:end].contiguous()}
 
 
 def gather_video_tokens(video: torch.Tensor, sp_group: dist.ProcessGroup) -> torch.Tensor:
