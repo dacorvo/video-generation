@@ -1,0 +1,16 @@
+[
+  {
+    "prompt": "A red fox trots through fresh snow in a sunlit pine forest, its breath steaming in the cold air. The camera tracks alongside it at ground level. Snow crunches under its paws and birds sing in the distance."
+  },
+  {
+    "prompt": "The red fox keeps trotting through the fresh snow as the pine trees thin out, then comes out of the forest onto the snowy shore of a wide frozen lake and slows to a walk. The camera keeps tracking alongside it at ground level in the bright winter sun. Snow crunches under its paws and a light wind blows across the ice.",
+    "from": {"shot": 1, "frames": 25}
+  },
+  {
+    "prompt": "A black raven perches on a snow-covered pine branch above a frozen lake, turning its head to watch something below. It ruffles its feathers, caws twice and takes off, shaking snow from the branch. Close-up shot with a shallow depth of field in bright winter sunlight. Its caws echo across the silent lake."
+  },
+  {
+    "prompt": "The red fox stands still on the snowy shore of the frozen lake, its ears pricked toward the cawing of a raven. It sniffs the air, then steps carefully onto the ice and trots away from the camera across the frozen lake, leaving small paw prints in a thin layer of snow. The camera stays low on the shore in the bright winter sun. The ice creaks softly and the wind whistles.",
+    "from": {"shot": 2, "frames": 1}
+  }
+]
