@@ -78,7 +78,8 @@ def decode_on_neuron(vae):
     import torch
 
     device = f"neuron:{torch.neuron.current_device()}"
-    vae.decoder.compile(backend="neuron", fullgraph=True, dynamic=False)
+    # Split by frames, the decoder exchanges frames with the other ranks between its compiled graphs.
+    vae.decoder.compile(backend="neuron", fullgraph=False, dynamic=False)
     decode = vae.decode
 
     def call(latents, *args, **kwargs):

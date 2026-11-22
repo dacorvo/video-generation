@@ -241,17 +241,29 @@ def frame_ranges(num_frames: int, world_size: int) -> list[tuple[int, int]]:
     return list(zip(starts[:-1], starts[1:]))
 
 
-def _frame_split_conv_forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    """`LTX2VideoCausalConv3d.forward`, its time padding taken from the neighboring ranks when it is not causal."""
-    if causal:
-        return LTX2VideoCausalConv3d.forward(self, hidden_states, causal=causal)
-    group, rank, world_size = self.frame_split
+@torch.compiler.disable
+def _pad_with_neighbors(
+    hidden_states: torch.Tensor, group: dist.ProcessGroup, rank: int, world_size: int
+) -> torch.Tensor:
+    """`hidden_states`, the frames of this rank of `group`, padded in time with the last frame of the previous rank and
+    the first frame of the next one, or with its own at the edges of the clip.
+
+    It runs between the compiled graphs of the decoder. Inside them, the all-gather of ranks whose frames differ in
+    number compiles to collectives that the Neuron runtime refuses to match across chips.
+    """
     first, last = hidden_states[:, :, :1], hidden_states[:, :, -1:]
     # The first and last frames of each rank, in rank order.
     edges = funcol.all_gather_tensor(torch.cat([first, last], dim=2).contiguous(), gather_dim=2, group=group)
     left = edges[:, :, 2 * rank - 1 : 2 * rank] if rank > 0 else first
     right = edges[:, :, 2 * rank + 2 : 2 * rank + 3] if rank < world_size - 1 else last
-    return self.conv(torch.cat([left, hidden_states, right], dim=2))
+    return torch.cat([left, hidden_states, right], dim=2)
+
+
+def _frame_split_conv_forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
+    """`LTX2VideoCausalConv3d.forward`, its time padding taken from the neighboring ranks when it is not causal."""
+    if causal:
+        return LTX2VideoCausalConv3d.forward(self, hidden_states, causal=causal)
+    return self.conv(_pad_with_neighbors(hidden_states, *self.frame_split))
 
 
 def _frame_split_upsampler_forward(self, hidden_states: torch.Tensor, causal: bool = True) -> torch.Tensor:
