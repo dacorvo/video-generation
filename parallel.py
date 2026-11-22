@@ -211,13 +211,17 @@ def load_transformer(
 
 
 def split_video_tokens(kwargs: dict, sp_group: dist.ProcessGroup) -> dict:
-    """The arguments of a call of the transformer, its video tokens and their positions cut to the range of this rank of
-    `sp_group`."""
+    """The arguments of a call of the transformer, its video tokens, their positions and, if it has one per token, their
+    timesteps, cut to the range of this rank of `sp_group`.
+
+    A clip that starts from frames has a timestep per video token, 0 on the tokens of those frames. The transformer
+    embeds it per token, and the audio tokens take their own timestep, so each rank only needs those of its tokens.
+    """
     for name in ("video_self_attention_mask", "video_keyframes_mask", "perturbation_mask"):
         if kwargs.get(name) is not None:
             raise NotImplementedError(f"{name} under sequence parallelism")
-    if kwargs.get("video_coords") is None or kwargs["timestep"].ndim > 1:
-        raise NotImplementedError("sequence parallelism without the video positions, or with a timestep per token")
+    if kwargs.get("video_coords") is None:
+        raise NotImplementedError("sequence parallelism without the video positions")
     rank, size = dist.get_rank(sp_group), dist.get_world_size(sp_group)
     tokens = kwargs["hidden_states"].shape[1]
     if tokens % size:
@@ -225,8 +229,11 @@ def split_video_tokens(kwargs: dict, sp_group: dist.ProcessGroup) -> dict:
     start, end = rank * tokens // size, (rank + 1) * tokens // size
     # The latents of LTX2Pipeline are a transposed view: torch-neuronx takes seconds to copy a slice of them to the
     # device, and milliseconds once the slice is contiguous.
-    return {**kwargs, "hidden_states": kwargs["hidden_states"][:, start:end].contiguous(),
-            "video_coords": kwargs["video_coords"][:, :, start:end].contiguous()}
+    split = {"hidden_states": kwargs["hidden_states"][:, start:end].contiguous(),
+             "video_coords": kwargs["video_coords"][:, :, start:end].contiguous()}
+    if kwargs["timestep"].ndim > 1:
+        split["timestep"] = kwargs["timestep"][:, start:end].contiguous()
+    return {**kwargs, **split}
 
 
 def gather_video_tokens(video: torch.Tensor, sp_group: dist.ProcessGroup) -> torch.Tensor:
