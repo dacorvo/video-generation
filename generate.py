@@ -52,11 +52,15 @@ def log(msg: str) -> None:
 def on_neuron(transformer, sp_group=None):
     """The forward of `transformer`, its blocks compiled for the NeuronCore of this rank: it takes and returns tensors
     on the host. With `sp_group`, the sequence-parallel group of this rank, it runs on the video tokens of this rank,
-    and returns the video output of all of them."""
+    and returns the video output of all of them. A timestep per video token, as for a clip that starts from frames, it
+    runs with two timesteps (see `timesteps`)."""
+    import contextlib
+
     import torch
     from torch.utils._pytree import tree_map
 
     import parallel
+    import timesteps
 
     device = f"neuron:{torch.neuron.current_device()}"
     # The blocks share one compiled graph, so a new process traces and lowers a single block. The rest of the forward
@@ -68,7 +72,9 @@ def on_neuron(transformer, sp_group=None):
         if sp_group is not None:
             kwargs = parallel.split_video_tokens(kwargs, sp_group)
         args, kwargs = tree_map(lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, (args, kwargs))
-        output = forward(*args, **kwargs)
+        per_token = kwargs["timestep"].ndim > 1
+        with timesteps.two_timesteps(transformer) if per_token else contextlib.nullcontext():
+            output = forward(*args, **kwargs)
         if sp_group is not None:
             output = (parallel.gather_video_tokens(output[0], sp_group), *output[1:])
         return tree_map(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, output)
