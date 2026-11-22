@@ -1,6 +1,8 @@
 """Generates a clip with its audio with LTX-2.5, its transformer split over NeuronCores, or all on CPU.
 
-The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. On
+The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. With
+--two-stage, it follows the two-stage recipe of the model card: it generates the clip at --width x --height as
+latents, the latent upsampler upscales them x2 on CPU, and the pipeline denoises them again at twice the size. On
 Neuron, `parallel` splits the transformer, and the decoder of the video VAE by frames, over the first --tp NeuronCores
 of NEURON_RT_VISIBLE_CORES, one torch.distributed rank per core, and torch.compile(backend="neuron") compiles the
 transformer's blocks and the decoder. With --sp, --sp groups of --tp cores split the video tokens of the transformer,
@@ -13,7 +15,7 @@ outputs/ is in the repository, and models/ in the working directory of the demo,
 
 Run with:
     ./run.sh generate.py [--cpu] [--prompt PROMPT] [--seed SEED] [--name NAME] [--width WIDTH] [--height HEIGHT]
-        [--frames FRAMES] [--tp TP] [--sp SP]
+        [--frames FRAMES] [--two-stage] [--tp TP] [--sp SP]
 """
 from __future__ import annotations
 
@@ -229,13 +231,11 @@ def load_models(sp: int = 1):
     return transformer, vae, dist.new_group(backend="gloo"), sp_group
 
 
-def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=None):
-    """The distilled LTX-2.5 pipeline in bf16, its tensors on the host. Its transformer and video VAE run on CPU, or
-    are `transformer` and `vae` on Neuron, with `group` and `sp_group`, as `load_models` returns them."""
+def on_host(pipeline_class):
+    """The diffusers pipeline class `pipeline_class`, made to run on the host."""
     import torch
-    from diffusers import LTX2Pipeline
 
-    class HostPipeline(LTX2Pipeline):
+    class HostPipeline(pipeline_class):
         # diffusers runs a pipeline on the device of its accelerated models. All
         # models but the transformer run on the host, and the transformer moves
         # its own inputs.
@@ -243,9 +243,18 @@ def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=
         def _execution_device(self):
             return torch.device("cpu")
 
+    return HostPipeline
+
+
+def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=None):
+    """The distilled LTX-2.5 pipeline in bf16, its tensors on the host. Its transformer and video VAE run on CPU, or
+    are `transformer` and `vae` on Neuron, with `group` and `sp_group`, as `load_models` returns them."""
+    import torch
+    from diffusers import LTX2Pipeline
+
     components = {} if transformer is None else {"transformer": transformer, "vae": vae}
     # The processor and the prompt enhancer serve prompt enhancement only.
-    pipe = HostPipeline.from_pretrained(
+    pipe = on_host(LTX2Pipeline).from_pretrained(
         MODEL_DIR, dtype=torch.bfloat16, processor=None, prompt_enhancer=None, **components
     )
     timed(pipe.transformer, calls, group, sp_group)
@@ -254,19 +263,37 @@ def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=
     return pipe
 
 
-def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: int):
-    """The video, as frames in [0, 1], and the audio of the clip of `prompt`."""
+def load_upsampler(pipe):
+    """The x2 latent upsampler of LTX-2.5 in bf16, on the host, as a pipeline that upscales the latents of `pipe`."""
     import torch
-    from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES
+    from diffusers import LTX2LatentUpsamplePipeline, LTX2LatentUpsamplerModel
 
-    return pipe(
+    upsampler = LTX2LatentUpsamplerModel.from_pretrained(
+        os.path.join(MODEL_DIR, "latent_upsampler"), dtype=torch.bfloat16
+    )
+    # On latents, the pipeline reads only the compression ratios of the VAE.
+    return on_host(LTX2LatentUpsamplePipeline)(vae=pipe.vae, latent_upsampler=upsampler)
+
+
+def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: int, upsample_pipe=None):
+    """The video, as frames in [0, 1], and the audio of the clip of `prompt`.
+
+    With `upsample_pipe`, the clip follows the two-stage distilled recipe of the model card: `pipe` makes it at `width`
+    x `height` as latents, `upsample_pipe` upscales them x2, and `pipe` denoises them again at twice the size, over
+    the last sigmas of the schedule.
+    """
+    import torch
+    from diffusers.pipelines.ltx2.utils import (
+        DEFAULT_NEGATIVE_PROMPT,
+        DISTILLED_SIGMA_VALUES,
+        STAGE_2_DISTILLED_SIGMA_VALUES,
+    )
+
+    settings = dict(
         prompt=prompt,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
-        width=width,
-        height=height,
         num_frames=num_frames,
         frame_rate=FPS,
-        sigmas=DISTILLED_SIGMA_VALUES,
         guidance_scale=1.0,
         audio_guidance_scale=1.0,
         stg_scale=0.0,
@@ -275,9 +302,30 @@ def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: 
         audio_modality_scale=1.0,
         # Drawn on the host, the noise is the same on Neuron and on CPU.
         generator=torch.Generator("cpu").manual_seed(seed),
-        output_type="np",
         return_dict=False,
     )
+    if upsample_pipe is None:
+        return pipe(width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="np", **settings)
+    t0 = time.time()
+    latents, audio_latents = pipe(
+        width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="latent", **settings
+    )
+    log(f"stage 1: {time.time() - t0:.0f} s")
+    t0 = time.time()
+    with torch.no_grad():
+        latents = upsample_pipe(latents=latents, output_type="latent", return_dict=False)[0]
+    log(f"upsampling: {time.time() - t0:.0f} s")
+    t0 = time.time()
+    video, audio = pipe(
+        latents=latents,
+        audio_latents=audio_latents,
+        sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
+        noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
+        output_type="np",
+        **settings,
+    )
+    log(f"stage 2: {time.time() - t0:.0f} s")
+    return video, audio
 
 
 def write_mp4(path: str, frames, audio, sample_rate: int) -> None:
@@ -326,10 +374,14 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--frames", type=int, default=NUM_FRAMES, help="one more than a multiple of 8")
+    parser.add_argument("--two-stage", action="store_true", help="upscale the clip x2 with the two-stage recipe of "
+                        "the model card")
     parser.add_argument("--tp", type=int, default=TP, help="the number of NeuronCores the weights are split over")
-    parser.add_argument("--sp", type=int, default=1, help="the number of groups of --tp NeuronCores that split the "
-                        "video tokens")
+    parser.add_argument("--sp", type=int, help="the number of groups of --tp NeuronCores that split the video tokens "
+                        "(default: 4 with --two-stage, else 1)")
     args = parser.parse_args()
+    # Split over 4 cores only, the block graph of the second stage fails to load.
+    args.sp = args.sp or (4 if args.two_stage else 1)
     if args.cpu:
         # Keeps torch from loading torch-neuronx: this run takes no NeuronCore.
         os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
@@ -347,16 +399,16 @@ def main() -> None:
             serve(transformer, vae, group, sp_group)
             return
     pipe = load_pipeline(calls, transformer, vae, group, sp_group)
+    upsample_pipe = load_upsampler(pipe) if args.two_stage else None
     log(f"load: {time.time() - t0:.0f} s")
     t0 = time.time()
-    video, audio = generate(pipe, args.prompt, args.seed, args.width, args.height, args.frames)
+    video, audio = generate(pipe, args.prompt, args.seed, args.width, args.height, args.frames, upsample_pipe)
     if group is not None:
         import torch.distributed as dist
 
         # The other ranks return from `serve`.
         dist.broadcast_object_list([None], src=0, group=group)
-    log(f"generation: {time.time() - t0:.0f} s, transformer: first call {calls[0]:.1f} s, "
-        f"then {sum(calls[1:]) / max(len(calls) - 1, 1):.2f} s per call over {len(calls) - 1}")
+    log(f"generation: {time.time() - t0:.0f} s, transformer calls: {', '.join(f'{c:.1f}' for c in calls)} s")
     name = args.name or ("cpu" if args.cpu else "neuron")
     save(video[0], audio[0].float().cpu(), pipe.vocoder.config.output_sampling_rate, name)
     log(f"wrote {os.path.join(OUTPUT_DIR, name)}.mp4")
