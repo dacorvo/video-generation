@@ -11,6 +11,7 @@ arguments of each transformer call and of the decode to the other ranks, which r
 them and decode their frames, which rank 0 gathers. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
+NAME is video-gen-demo-WIDTHxHEIGHT by default, after the size of the clip, with -cpu on CPU.
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
 
 Run with:
@@ -370,7 +371,8 @@ def main() -> None:
     parser.add_argument("--cpu", action="store_true", help="run the whole pipeline on CPU")
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--name", help="the name of the outputs (default: neuron, or cpu with --cpu)")
+    parser.add_argument("--name", help="the name of the outputs (default: video-gen-demo-WIDTHxHEIGHT, after the size "
+                        "of the clip, with -cpu on CPU)")
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--frames", type=int, default=NUM_FRAMES, help="one more than a multiple of 8")
@@ -409,7 +411,8 @@ def main() -> None:
         # The other ranks return from `serve`.
         dist.broadcast_object_list([None], src=0, group=group)
     log(f"generation: {time.time() - t0:.0f} s, transformer calls: {', '.join(f'{c:.1f}' for c in calls)} s")
-    name = args.name or ("cpu" if args.cpu else "neuron")
+    height, width = video[0].shape[1:3]
+    name = args.name or f"video-gen-demo-{width}x{height}" + ("-cpu" if args.cpu else "")
     save(video[0], audio[0].float().cpu(), pipe.vocoder.config.output_sampling_rate, name)
     log(f"wrote {os.path.join(OUTPUT_DIR, name)}.mp4")
 

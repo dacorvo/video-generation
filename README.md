@@ -32,9 +32,10 @@ With `--two-stage`, [`generate.py`](generate.py) follows the two-stage recipe of
 the model card: 8 steps at 1024x512, the x2 latent upsampler on CPU, then 3
 steps at 2048x1024.
 
-[`generate.py`](generate.py) writes the clip to `outputs/`: an mp4 with its
-audio, 4 of its frames as a png, and its frames and audio as an npz. `--prompt`
-and `--seed` set what it generates.
+[`generate.py`](generate.py) writes the clip to `outputs/`, named after the
+demo and its size, such as `video-gen-demo-2048x1024`: an mp4 with its audio, 4
+of its frames as a png, and its frames and audio as an npz. `--prompt` and
+`--seed` set what it generates.
 
 ## Checks
 
