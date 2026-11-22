@@ -1,5 +1,6 @@
 """How the LTX-2.5 models of diffusers split over the ranks of a group: the
-transformer by tensor parallelism, the decoder of the video VAE by frames.
+transformer by tensor parallelism, and optionally by its video tokens on top,
+the decoder of the video VAE by frames.
 
 diffusers splits a model over the ranks of a tensor-parallel group as it loads
 it, when the model's class has a `_tp_plan`. `LTX2VideoTransformer3DModel` has
@@ -11,6 +12,12 @@ feed-forwards the same way.
 The attention processor of diffusers cannot run on a slice of the heads: it
 normalizes queries and keys over all heads, and reshapes them by the full head
 count. `TensorParallelAttnProcessor` runs in its place.
+
+With sequence parallelism on top, each rank of a sequence-parallel group runs
+the transformer on a range of the video tokens, with all the audio tokens and
+the text. Only two attentions need the video tokens of the other ranks: the
+video self-attention, where an all-to-all swaps tokens for heads around the
+attention, and the video-to-audio attention, which gathers its keys and values.
 
 With the decoder split by frames, each rank decodes a contiguous range of the
 latent frames. The decoder's temporal convolutions (kernel 3, stride 1) pad
@@ -78,6 +85,10 @@ class TensorParallelAttnProcessor:
         cos, sin = (f.chunk(self.world_size, dim=1)[self.rank] for f in freqs)
         return apply_split_rotary_emb(x, (cos, sin))
 
+    def attend(self, query, key, value, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        """The attention of `query` over `key` and `value`, all as (batch, tokens, heads, head dim)."""
+        return dispatch_attention_fn(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
+
     def __call__(
         self,
         attn,
@@ -115,13 +126,8 @@ class TensorParallelAttnProcessor:
             query = self.rope(query, query_rotary_emb)
             key = self.rope(key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb)
 
-        hidden_states = dispatch_attention_fn(
-            query.unflatten(2, (heads, -1)),
-            key.unflatten(2, (heads, -1)),
-            value.unflatten(2, (heads, -1)),
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
+        hidden_states = self.attend(
+            query.unflatten(2, (heads, -1)), key.unflatten(2, (heads, -1)), value.unflatten(2, (heads, -1)), attention_mask
         )
         if attn.to_gate_logits is not None:
             # The factor of 2 makes zero logits a gate of 1.
@@ -132,16 +138,98 @@ class TensorParallelAttnProcessor:
         return attn.to_out[1](hidden_states)
 
 
-def load_transformer(path: str, mesh, dtype: torch.dtype = torch.bfloat16) -> TensorParallelLTX2Transformer:
+class SequenceParallelSelfAttnProcessor(TensorParallelAttnProcessor):
+    """The video self-attention of `TensorParallelAttnProcessor`, the video tokens split over the ranks of `sp_group`.
+
+    An all-to-all swaps the tokens of this rank for the heads of this rank of the group, so that the rank attends over
+    all tokens with its heads, and a second all-to-all swaps them back.
+    """
+
+    def __init__(self, group: dist.ProcessGroup, sp_group: dist.ProcessGroup):
+        super().__init__(group)
+        self.sp_group = sp_group
+        self.sp_size = dist.get_world_size(sp_group)
+
+    def tokens_to_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """`x`, the tokens of this rank with all heads, as all tokens with the heads of this rank of the group."""
+        batch, tokens, heads, dim = x.shape
+        # The heads of SP rank i go to it, and the tokens of SP rank i come back in place i.
+        chunks = x.unflatten(2, (self.sp_size, heads // self.sp_size)).permute(2, 0, 1, 3, 4).contiguous()
+        received = funcol.all_to_all_single(chunks, None, None, group=self.sp_group)
+        return received.permute(1, 0, 2, 3, 4).reshape(batch, self.sp_size * tokens, heads // self.sp_size, dim)
+
+    def heads_to_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """`x`, all tokens with the heads of this rank of the group, as the tokens of this rank with all heads."""
+        batch, tokens, heads, dim = x.shape
+        chunks = x.unflatten(1, (self.sp_size, tokens // self.sp_size)).permute(1, 0, 2, 3, 4).contiguous()
+        received = funcol.all_to_all_single(chunks, None, None, group=self.sp_group)
+        return received.permute(1, 2, 0, 3, 4).reshape(batch, tokens // self.sp_size, self.sp_size * heads, dim)
+
+    def attend(self, query, key, value, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        if attention_mask is not None:
+            raise NotImplementedError("a video self-attention mask under sequence parallelism")
+        query, key, value = (self.tokens_to_heads(x) for x in (query, key, value))
+        return self.heads_to_tokens(super().attend(query, key, value, attention_mask))
+
+
+class SequenceParallelKeysAttnProcessor(TensorParallelAttnProcessor):
+    """The video-to-audio attention of `TensorParallelAttnProcessor`, the video tokens, its keys and values, split over
+    the ranks of `sp_group`: it gathers them from all ranks of the group."""
+
+    def __init__(self, group: dist.ProcessGroup, sp_group: dist.ProcessGroup):
+        super().__init__(group)
+        self.sp_group = sp_group
+
+    def attend(self, query, key, value, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        if attention_mask is not None:
+            raise NotImplementedError("a video-to-audio attention mask under sequence parallelism")
+        key, value = (funcol.all_gather_tensor(x.contiguous(), gather_dim=1, group=self.sp_group) for x in (key, value))
+        return super().attend(query, key, value, attention_mask)
+
+
+def load_transformer(
+    path: str, mesh, sp_group: dist.ProcessGroup | None = None, dtype: torch.dtype = torch.bfloat16
+) -> TensorParallelLTX2Transformer:
     """The LTX-2.5 transformer saved at `path`, in `dtype`, split over the ranks of the 1-D device mesh `mesh`, its
-    gelus computed in fp32."""
+    gelus computed in fp32. With `sp_group`, it runs on the range of the video tokens of this rank of that group too
+    (see `split_video_tokens`)."""
     # Each rank reads only its slice of each split weight.
     transformer = TensorParallelLTX2Transformer.from_pretrained(
         path, dtype=dtype, parallel_config=TensorParallelConfig(mesh=mesh)
     )
     transformer.set_attn_processor(TensorParallelAttnProcessor(mesh.get_group()))
+    if sp_group is not None:
+        # The other attentions take the video tokens of this rank, the audio tokens or the text as queries, and the
+        # audio tokens or the text as keys, which every rank holds.
+        self_attention = SequenceParallelSelfAttnProcessor(mesh.get_group(), sp_group)
+        video_keys = SequenceParallelKeysAttnProcessor(mesh.get_group(), sp_group)
+        for block in transformer.transformer_blocks:
+            block.attn1.set_processor(self_attention)
+            block.video_to_audio_attn.set_processor(video_keys)
     numerics.gelu_in_fp32(transformer)
     return transformer
+
+
+def split_video_tokens(kwargs: dict, sp_group: dist.ProcessGroup) -> dict:
+    """The arguments of a call of the transformer, its video tokens and their positions cut to the range of this rank of
+    `sp_group`."""
+    for name in ("video_self_attention_mask", "video_keyframes_mask", "perturbation_mask"):
+        if kwargs.get(name) is not None:
+            raise NotImplementedError(f"{name} under sequence parallelism")
+    if kwargs.get("video_coords") is None or kwargs["timestep"].ndim > 1:
+        raise NotImplementedError("sequence parallelism without the video positions, or with a timestep per token")
+    rank, size = dist.get_rank(sp_group), dist.get_world_size(sp_group)
+    tokens = kwargs["hidden_states"].shape[1]
+    if tokens % size:
+        raise ValueError(f"{tokens} video tokens do not split over {size} ranks")
+    start, end = rank * tokens // size, (rank + 1) * tokens // size
+    return {**kwargs, "hidden_states": kwargs["hidden_states"][:, start:end],
+            "video_coords": kwargs["video_coords"][:, :, start:end]}
+
+
+def gather_video_tokens(video: torch.Tensor, sp_group: dist.ProcessGroup) -> torch.Tensor:
+    """The video output of the transformer for all tokens, from the range of this rank of `sp_group`."""
+    return funcol.all_gather_tensor(video.contiguous(), gather_dim=1, group=sp_group)
 
 
 def frame_ranges(num_frames: int, world_size: int) -> list[tuple[int, int]]:

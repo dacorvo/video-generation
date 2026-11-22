@@ -3,16 +3,17 @@
 The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. On
 Neuron, `parallel` splits the transformer, and the decoder of the video VAE by frames, over the first --tp NeuronCores
 of NEURON_RT_VISIBLE_CORES, one torch.distributed rank per core, and torch.compile(backend="neuron") compiles the
-transformer's blocks and the decoder. Only rank 0 runs the pipeline, its other models on CPU. It sends the arguments of
-each transformer call and of the decode to the other ranks, which run their slices of the transformer on them and
-decode their frames, which rank 0 gathers. With --cpu, the whole pipeline runs on CPU.
+transformer's blocks and the decoder. With --sp, --sp groups of --tp cores split the video tokens of the transformer,
+and the decoder runs on all of their cores. Only rank 0 runs the pipeline, its other models on CPU. It sends the
+arguments of each transformer call and of the decode to the other ranks, which run their slices of the transformer on
+them and decode their frames, which rank 0 gathers. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
 
 Run with:
     ./run.sh generate.py [--cpu] [--prompt PROMPT] [--seed SEED] [--name NAME] [--width WIDTH] [--height HEIGHT]
-        [--frames FRAMES] [--tp TP]
+        [--frames FRAMES] [--tp TP] [--sp SP]
 """
 from __future__ import annotations
 
@@ -44,11 +45,14 @@ def log(msg: str) -> None:
         print(f"[generate] {msg}", flush=True)
 
 
-def on_neuron(transformer):
+def on_neuron(transformer, sp_group=None):
     """The forward of `transformer`, its blocks compiled for the NeuronCore of this rank: it takes and returns tensors
-    on the host."""
+    on the host. With `sp_group`, the sequence-parallel group of this rank, it runs on the video tokens of this rank,
+    and returns the video output of all of them."""
     import torch
     from torch.utils._pytree import tree_map
+
+    import parallel
 
     device = f"neuron:{torch.neuron.current_device()}"
     # The blocks share one compiled graph, so a new process traces and lowers a single block. The rest of the forward
@@ -57,8 +61,13 @@ def on_neuron(transformer):
     forward = transformer.forward
 
     def call(*args, **kwargs):
+        if sp_group is not None:
+            kwargs = parallel.split_video_tokens(kwargs, sp_group)
         args, kwargs = tree_map(lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, (args, kwargs))
-        return tree_map(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, forward(*args, **kwargs))
+        output = forward(*args, **kwargs)
+        if sp_group is not None:
+            output = (parallel.gather_video_tokens(output[0], sp_group), *output[1:])
+        return tree_map(lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, output)
 
     return call
 
@@ -97,15 +106,16 @@ def split_decode(vae, group) -> None:
     vae.decode = call
 
 
-def timed(transformer, calls: list, group=None) -> None:
+def timed(transformer, calls: list, group=None, sp_group=None) -> None:
     """Makes `transformer` append the duration of each of its calls to `calls`.
 
     With `group`, the gloo group of the ranks that split `transformer` over their NeuronCores, it runs on the core of
     this rank, after it sends the arguments of the call to the other ranks, which run their slices on them (`serve`).
+    `sp_group` is the sequence-parallel group of this rank, if any (see `on_neuron`).
     """
     import torch.distributed as dist
 
-    forward = transformer.forward if group is None else on_neuron(transformer)
+    forward = transformer.forward if group is None else on_neuron(transformer, sp_group)
 
     def call(*args, **kwargs):
         t0 = time.time()
@@ -118,14 +128,15 @@ def timed(transformer, calls: list, group=None) -> None:
     transformer.forward = call
 
 
-def serve(transformer, vae, group) -> None:
+def serve(transformer, vae, group, sp_group=None) -> None:
     """Runs on the NeuronCore of this rank, on the arguments that rank 0 sends over `group`, the slice of `transformer`
     of this rank for each transformer call (see `timed`), and the decoder of `vae` on the frames of this rank for each
-    decode, which it then sends to rank 0 (see `split_decode`), until it sends None."""
+    decode, which it then sends to rank 0 (see `split_decode`), until it sends None. `sp_group` is the
+    sequence-parallel group of this rank, if any (see `on_neuron`)."""
     import torch
     import torch.distributed as dist
 
-    forward = on_neuron(transformer)
+    forward = on_neuron(transformer, sp_group)
     decode = decode_on_neuron(vae)
     while True:
         message = [None]
@@ -184,10 +195,14 @@ def pack_parameters(module, alignment: int = 4096, max_buffer: int = 2**30) -> N
         module.get_submodule(path).register_parameter(attr, torch.nn.Parameter(view, requires_grad=requires_grad))
 
 
-def load_models():
+def load_models(sp: int = 1):
     """The slice of the LTX-2.5 transformer of this rank, and the video VAE, its decoder on the NeuronCore of this rank,
-    both split over the NeuronCores of all ranks, and a gloo group of all ranks, which sends the arguments of their
-    calls."""
+    both split over the NeuronCores of all ranks, a gloo group of all ranks, which sends the arguments of their calls,
+    and the sequence-parallel group of this rank, or None.
+
+    With `sp` above 1, `sp` groups of ranks, each on its own cores, split the video tokens of the transformer, and the
+    ranks of each group split its weights.
+    """
     import torch
     import torch.distributed as dist
     from diffusers import AutoencoderKLLTX2Video
@@ -196,20 +211,26 @@ def load_models():
     import parallel
 
     dist.init_process_group(backend="neuron")
-    mesh = DeviceMesh("neuron", list(range(dist.get_world_size())))
-    transformer = parallel.load_transformer(os.path.join(MODEL_DIR, "transformer"), mesh)
+    world_size = dist.get_world_size()
+    if sp > 1:
+        # Consecutive ranks share a chip, and so do the ranks that split the weights.
+        mesh = DeviceMesh("neuron", torch.arange(world_size).reshape(sp, world_size // sp), mesh_dim_names=("sp", "tp"))
+        tp_mesh, sp_group = mesh["tp"], mesh["sp"].get_group()
+    else:
+        tp_mesh, sp_group = DeviceMesh("neuron", list(range(world_size))), None
+    transformer = parallel.load_transformer(os.path.join(MODEL_DIR, "transformer"), tp_mesh, sp_group)
     pack_parameters(transformer)
     vae = AutoencoderKLLTX2Video.from_pretrained(os.path.join(MODEL_DIR, "vae"), dtype=torch.bfloat16)
     # The pipeline normalizes the latents on the host with the other tensors of the VAE.
     vae.decoder.to(f"neuron:{torch.neuron.current_device()}")
     pack_parameters(vae.decoder)
-    parallel.split_by_frames(vae, mesh.get_group())
-    return transformer, vae, dist.new_group(backend="gloo")
+    parallel.split_by_frames(vae, dist.group.WORLD)
+    return transformer, vae, dist.new_group(backend="gloo"), sp_group
 
 
-def load_pipeline(calls: list, transformer=None, vae=None, group=None):
+def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=None):
     """The distilled LTX-2.5 pipeline in bf16, its tensors on the host. Its transformer and video VAE run on CPU, or
-    are `transformer` and `vae` on Neuron, with `group`, as `load_models` returns them."""
+    are `transformer` and `vae` on Neuron, with `group` and `sp_group`, as `load_models` returns them."""
     import torch
     from diffusers import LTX2Pipeline
 
@@ -226,7 +247,7 @@ def load_pipeline(calls: list, transformer=None, vae=None, group=None):
     pipe = HostPipeline.from_pretrained(
         MODEL_DIR, dtype=torch.bfloat16, processor=None, prompt_enhancer=None, **components
     )
-    timed(pipe.transformer, calls, group)
+    timed(pipe.transformer, calls, group, sp_group)
     if group is not None:
         split_decode(pipe.vae, group)
     return pipe
@@ -304,25 +325,27 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--frames", type=int, default=NUM_FRAMES, help="one more than a multiple of 8")
-    parser.add_argument("--tp", type=int, default=TP, help="the number of NeuronCores the models are split over")
+    parser.add_argument("--tp", type=int, default=TP, help="the number of NeuronCores the weights are split over")
+    parser.add_argument("--sp", type=int, default=1, help="the number of groups of --tp NeuronCores that split the "
+                        "video tokens")
     args = parser.parse_args()
     if args.cpu:
         # Keeps torch from loading torch-neuronx: this run takes no NeuronCore.
         os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     else:
-        launch.set_neuron_environment(args.tp)
+        launch.set_neuron_environment(args.tp * args.sp)
         if "LOCAL_RANK" not in os.environ:
-            raise SystemExit(launch.torchrun(__file__, args.tp, sys.argv[1:]))
+            raise SystemExit(launch.torchrun(__file__, args.tp * args.sp, sys.argv[1:]))
 
     calls = []
     t0 = time.time()
-    transformer = vae = group = None
+    transformer = vae = group = sp_group = None
     if not args.cpu:
-        transformer, vae, group = load_models()
+        transformer, vae, group, sp_group = load_models(args.sp)
         if RANK != 0:
-            serve(transformer, vae, group)
+            serve(transformer, vae, group, sp_group)
             return
-    pipe = load_pipeline(calls, transformer, vae, group)
+    pipe = load_pipeline(calls, transformer, vae, group, sp_group)
     log(f"load: {time.time() - t0:.0f} s")
     t0 = time.time()
     video, audio = generate(pipe, args.prompt, args.seed, args.width, args.height, args.frames)
