@@ -81,6 +81,13 @@ into the shot:
 {"prompt": "...", "caption": {"text": "GOOOAAAATTT", "start": 4.4, "end": 6.4}}
 ```
 
+A shot can be trimmed to the time range from `start` to `end`, in seconds into
+the shot, as all shots come out the same length:
+
+```json
+{"prompt": "...", "trim": {"start": 3.0, "end": 6.5}}
+```
+
 The number of frames is one more than a multiple of 8, as the VAE encodes the
 frames after the first by 8. The film leaves out the frames a shot starts
 from, which repeat the earlier shot, and the frames of a shot from its

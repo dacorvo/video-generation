@@ -454,6 +454,9 @@ def read_film(path: str, num_frames: int) -> list[dict]:
             and 0 <= caption.get("start", -1) < caption.get("end", -1) <= num_frames / FPS
         ):
             raise SystemExit(f"{path}: the caption of shot {number} needs a text, a start and an end within the shot")
+        trim = shot.get("trim")
+        if trim is not None and not (0 <= trim.get("start", -1) < trim.get("end", -1) <= num_frames / FPS):
+            raise SystemExit(f"{path}: the trim of shot {number} needs a start and an end within the shot")
     return shots
 
 
@@ -510,8 +513,9 @@ def level_audio(audio, sample_rate: int):
 def edit_film(clips: list, shots: list[dict], sample_rate: int):
     """The frames and audio of the film of `shots`, of which `clips` holds the frames and audio: its shots one after the
     other, each without the frames it starts from, which repeat those of an earlier shot, and without its frames from
-    the keyframes it ends on, which a later shot repeats. A shot can have a caption, drawn on its frames from its start
-    to its end, in seconds into the shot. Its sound has the background of its shots evened out (see `level_audio`)."""
+    the keyframes it ends on, which a later shot repeats. A shot can be trimmed to a time range, and have a caption,
+    drawn on its frames from its start to its end, both in seconds into the shot. Its sound has the background of its
+    shots evened out (see `level_audio`)."""
     import numpy as np
 
     frames, audio = [], []
@@ -519,6 +523,8 @@ def edit_film(clips: list, shots: list[dict], sample_rate: int):
         skip, stop = shot.get("from", {}).get("frames", 0), len(shot_frames)
         if "to" in shot:
             stop = (keyframe_index(len(shot_frames), shot["to"]["frames"]) - 1) * 8 + 1
+        if "trim" in shot:
+            skip, stop = max(skip, round(shot["trim"]["start"] * FPS)), min(stop, round(shot["trim"]["end"] * FPS))
         kept = shot_frames[skip:stop]
         if "caption" in shot:
             first, last = (round(shot["caption"][key] * FPS) - skip for key in ("start", "end"))
