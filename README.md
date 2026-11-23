@@ -41,9 +41,8 @@ with `-1`, `-2`...
 
 ## Films
 
-With `--film`, [`generate.py`](generate.py) makes the shots of a film, one
-after the other in the same process, then the film, its shots edited one after
-the other:
+With `--film`, [`generate.py`](generate.py) makes the shots of a film in the
+same process, then the film, its shots edited one after the other:
 
 ```bash
 ./run.sh generate.py --two-stage --film films/fox.json  # outputs/fox-2048x1024-full.mp4, and its shots fox-2048x1024-shot-1.mp4...
@@ -60,11 +59,20 @@ frames of an earlier shot, which it keeps as its first frames:
   with the same look, as prompts alone do not keep it.
 - From the last 25 frames (1 s), a shot continues the motion of the shot.
 
+A shot can also end on the first frames of a later shot, which the pipeline
+takes as keyframes, so that the shot leads into it. The process then makes the
+later shot first:
+
+```json
+{"prompt": "...", "to": {"shot": 3, "frames": 25}}
+```
+
 The number of frames is one more than a multiple of 8, as the VAE encodes the
-frames after the first by 8. The film leaves them out, as they repeat the
-earlier shot. In [`films/fox.json`](films/fox.json), shot 2 continues shot 1,
-shot 3 cuts to a raven, and shot 4 returns to the fox from the last frame of
-shot 2.
+frames after the first by 8. The film leaves out the frames a shot starts
+from, which repeat the earlier shot, and the frames of a shot from its
+keyframes on, which the later shot repeats. In [`films/fox.json`](films/fox.json),
+shot 2 continues shot 1, shot 3 cuts to a raven, and shot 4 returns to the fox
+from the last frame of shot 2.
 
 ## Checks
 

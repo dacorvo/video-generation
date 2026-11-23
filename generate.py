@@ -15,10 +15,12 @@ NAME is video-gen-demo-WIDTHxHEIGHT by default, after the size of the clip, with
 the process makes one clip per prompt, one after the other, and their names end with -1, -2...
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
 
-With --film, the process makes the shots of a film, NAME-shot-1, NAME-shot-2..., one after the other, then the film,
-NAME-full, its shots one after the other. A shot can start from the last frames of an earlier shot, which the condition
-pipeline of diffusers keeps as its first frames. From the last frame of a shot, it returns to its subject after a cut.
-From its last second, it continues its motion. The film leaves out those frames, which repeat the earlier shot. NAME is
+With --film, the process makes the shots of a film, NAME-shot-1, NAME-shot-2..., then the film, NAME-full, its shots
+one after the other. A shot can start from the last frames of an earlier shot, which the condition pipeline of diffusers
+keeps as its first frames. From the last frame of a shot, it returns to its subject after a cut. From its last second,
+it continues its motion. A shot can also end on the first frames of a later shot, which the condition pipeline takes as
+keyframes: it then leads into that shot, which the process makes first. The film leaves out the frames a shot starts
+from, which repeat the earlier shot, and those of a shot from its keyframes on, which the later shot repeats. NAME is
 FILM-WIDTHxHEIGHT by default, after the file of the film.
 
 Run with:
@@ -298,7 +300,16 @@ def load_condition_pipeline(pipe):
     return on_host(LTX2ConditionPipeline)(**pipe.components)
 
 
-def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: int, upsample_pipe=None, start=None):
+def keyframe_index(num_frames: int, count: int) -> int:
+    """The latent index of the `count` frames, one more than a multiple of 8, that a clip of `num_frames` frames ends
+    on. As the VAE encodes the frames after the first by 8, the condition pipeline places them from frame
+    (index - 1) * 8 + 1 of the clip, and the last of them on the first frame of its last latent."""
+    return (num_frames - 1) // 8 - (count - 1) // 8
+
+
+def generate(
+    pipe, prompt: str, seed: int, width: int, height: int, num_frames: int, upsample_pipe=None, start=None, end=None
+):
     """The video, as frames in [0, 1], and the audio of the clip of `prompt`.
 
     With `upsample_pipe`, the clip follows the two-stage distilled recipe of the model card: `pipe` makes it at `width`
@@ -306,7 +317,8 @@ def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: 
     the last sigmas of the schedule.
 
     With `start`, frames in uint8 RGB, the clip starts from them: `pipe`, a pipeline of `load_condition_pipeline`, keeps
-    them as its first frames, which it scales to the size of each stage.
+    them as its first frames, which it scales to the size of each stage. With `end`, frames in uint8 RGB, the clip ends
+    on them: `pipe` takes them as keyframes (see `keyframe_index`), after which the clip goes on for 7 frames.
     """
     import torch
     from diffusers.pipelines.ltx2.utils import (
@@ -330,10 +342,14 @@ def generate(pipe, prompt: str, seed: int, width: int, height: int, num_frames: 
         generator=torch.Generator("cpu").manual_seed(seed),
         return_dict=False,
     )
-    if start is not None:
+    if start is not None or end is not None:
         from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
 
-        settings["conditions"] = [LTX2VideoCondition(frames=start, index=0)]
+        settings["conditions"] = []
+        if start is not None:
+            settings["conditions"].append(LTX2VideoCondition(frames=start, index=0))
+        if end is not None:
+            settings["conditions"].append(LTX2VideoCondition(frames=end, index=keyframe_index(num_frames, len(end))))
     if upsample_pipe is None:
         return pipe(width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="np", **settings)
     t0 = time.time()
@@ -399,9 +415,10 @@ def save(frames, audio, sample_rate: int, name: str, npz: bool = True) -> None:
 
 
 def read_film(path: str, num_frames: int) -> list[dict]:
-    """The shots of the film of the JSON file `path`, a list of shots of `num_frames` frames. Each has a "prompt", and
-    can start from the last frames of an earlier shot, {"from": {"shot": NUMBER, "frames": COUNT}}, which it then keeps
-    as its first frames. As the VAE encodes the frames after the first by 8, COUNT is one more than a multiple of 8."""
+    """The shots of the film of the JSON file `path`, a list of shots of `num_frames` frames. Each has a "prompt", can
+    start from the last frames of an earlier shot, {"from": {"shot": NUMBER, "frames": COUNT}}, which it then keeps as
+    its first frames, and can end on the first frames of a later shot, {"to": {"shot": NUMBER, "frames": COUNT}}. As the
+    VAE encodes the frames after the first by 8, COUNT is one more than a multiple of 8."""
     import json
 
     with open(path) as f:
@@ -409,26 +426,49 @@ def read_film(path: str, num_frames: int) -> list[dict]:
     if not shots:
         raise SystemExit(f"{path}: the film has no shot")
     for number, shot in enumerate(shots, 1):
-        start = shot.get("from")
-        if start is None:
-            continue
-        if not (1 <= start["shot"] < number and 1 <= start["frames"] <= num_frames and start["frames"] % 8 == 1):
+        start, end = shot.get("from"), shot.get("to")
+        if start is not None and not (
+            1 <= start["shot"] < number and 1 <= start["frames"] <= num_frames and start["frames"] % 8 == 1
+        ):
             raise SystemExit(f"{path}: shot {number} can only start from the last 1, 9, 17... frames of an earlier shot")
+        # The keyframes start after the first latent of the clip.
+        if end is not None and not (
+            number < end["shot"] <= len(shots) and 1 <= end["frames"] <= num_frames - 8 and end["frames"] % 8 == 1
+        ):
+            raise SystemExit(f"{path}: shot {number} can only end on the first 1, 9, 17... frames of a later shot")
     return shots
+
+
+def generation_order(shots: list[dict]) -> list[int]:
+    """The indices of `shots` in an order that makes each shot after those it starts from or ends on."""
+    order = []
+    while len(order) < len(shots):
+        ready = [
+            i
+            for i, shot in enumerate(shots)
+            if i not in order and all(shot[key]["shot"] - 1 in order for key in ("from", "to") if key in shot)
+        ]
+        if not ready:
+            raise SystemExit("the film has shots that start from or end on each other")
+        order.append(ready[0])
+    return order
 
 
 def edit_film(clips: list, shots: list[dict], sample_rate: int):
     """The frames and audio of the film of `shots`, of which `clips` holds the frames and audio: its shots one after the
-    other, each without the frames it starts from, which repeat those of an earlier shot."""
+    other, each without the frames it starts from, which repeat those of an earlier shot, and without its frames from
+    the keyframes it ends on, which a later shot repeats."""
     import numpy as np
 
     frames, audio = [], []
     for (shot_frames, shot_audio), shot in zip(clips, shots):
-        skip = shot.get("from", {}).get("frames", 0)
-        frames.append(shot_frames[skip:])
+        skip, stop = shot.get("from", {}).get("frames", 0), len(shot_frames)
+        if "to" in shot:
+            stop = (keyframe_index(len(shot_frames), shot["to"]["frames"]) - 1) * 8 + 1
+        frames.append(shot_frames[skip:stop])
         # The audio of a clip ends a little before its frames (32 ms with the vocoder of LTX-2.5): padded to their
         # length, each shot keeps the film in sync.
-        offset, length = round(skip / FPS * sample_rate), round((len(shot_frames) - skip) / FPS * sample_rate)
+        offset, length = round(skip / FPS * sample_rate), round((stop - skip) / FPS * sample_rate)
         shot_audio = shot_audio[:, offset : offset + length]
         audio.append(np.pad(shot_audio, ((0, 0), (0, length - shot_audio.shape[1]))))
     return np.concatenate(frames), np.concatenate(audio, axis=1)
@@ -456,6 +496,7 @@ def main() -> None:
                         "(default: 4 with --two-stage, else 1)")
     args = parser.parse_args()
     shots = read_film(args.film, args.frames) if args.film else [{"prompt": prompt} for prompt in args.prompt]
+    order = generation_order(shots)
     # Split over 4 cores only, the block graph of the second stage fails to load.
     args.sp = args.sp or (4 if args.two_stage else 1)
     if args.cpu:
@@ -476,23 +517,29 @@ def main() -> None:
             return
     pipe = load_pipeline(calls, transformer, vae, group, sp_group)
     upsample_pipe = load_upsampler(pipe) if args.two_stage else None
-    condition_pipe = load_condition_pipeline(pipe) if any("from" in shot for shot in shots) else None
+    conditioned = any("from" in shot or "to" in shot for shot in shots)
+    condition_pipe = load_condition_pipeline(pipe) if conditioned else None
     log(f"load: {time.time() - t0:.0f} s")
     import numpy as np
 
     sample_rate = pipe.vocoder.config.output_sampling_rate
-    # The frames, in uint8 RGB, and the audio of each clip made.
-    clips = []
-    for i, shot in enumerate(shots):
+    # The frames, in uint8 RGB, and the audio of each clip, once made.
+    clips = [None] * len(shots)
+    for i in order:
+        shot = shots[i]
         calls.clear()
         t0 = time.time()
-        start = None
+        start = end = None
         if "from" in shot:
             source, count = shot["from"]["shot"], shot["from"]["frames"]
             log(f"shot {i + 1}: starts from the last {count} frames of shot {source}")
             start = clips[source - 1][0][-count:]
+        if "to" in shot:
+            target, count = shot["to"]["shot"], shot["to"]["frames"]
+            log(f"shot {i + 1}: ends on the first {count} frames of shot {target}")
+            end = clips[target - 1][0][:count]
         video, audio = generate(
-            pipe if start is None else condition_pipe,
+            pipe if start is None and end is None else condition_pipe,
             shot["prompt"],
             args.seed,
             args.width,
@@ -500,14 +547,15 @@ def main() -> None:
             args.frames,
             upsample_pipe,
             start,
+            end,
         )
-        if group is not None and i == len(shots) - 1:
+        if group is not None and i == order[-1]:
             import torch.distributed as dist
 
             # The other ranks return from `serve`.
             dist.broadcast_object_list([None], src=0, group=group)
         log(f"generation: {time.time() - t0:.0f} s, transformer calls: {', '.join(f'{c:.1f}' for c in calls)} s")
-        clips.append(((np.clip(video[0], 0, 1) * 255).round().astype(np.uint8), audio[0].float().cpu().numpy()))
+        clips[i] = ((np.clip(video[0], 0, 1) * 255).round().astype(np.uint8), audio[0].float().cpu().numpy())
         height, width = video[0].shape[1:3]
         stem = os.path.splitext(os.path.basename(args.film))[0] if args.film else "video-gen-demo"
         name = args.name or f"{stem}-{width}x{height}" + ("-cpu" if args.cpu else "")
@@ -515,7 +563,7 @@ def main() -> None:
             clip_name = f"{name}-shot-{i + 1}"
         else:
             clip_name = f"{name}-{i + 1}" if len(shots) > 1 else name
-        save(*clips[-1], sample_rate, clip_name)
+        save(*clips[i], sample_rate, clip_name)
         log(f"wrote {os.path.join(OUTPUT_DIR, clip_name)}.mp4, {time.time() - t0:.0f} s after the start of the clip")
     if args.film:
         t0 = time.time()
