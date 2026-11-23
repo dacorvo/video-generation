@@ -447,6 +447,13 @@ def read_film(path: str, num_frames: int) -> list[dict]:
             raise SystemExit(f"{path}: shot {number} can only end on the first 1, 9, 17... frames of a later shot")
         if not isinstance(shot.get("seed", 0), int):
             raise SystemExit(f"{path}: the seed of shot {number} is not an integer")
+        caption = shot.get("caption")
+        if caption is not None and not (
+            isinstance(caption.get("text"), str)
+            and caption["text"]
+            and 0 <= caption.get("start", -1) < caption.get("end", -1) <= num_frames / FPS
+        ):
+            raise SystemExit(f"{path}: the caption of shot {number} needs a text, a start and an end within the shot")
     return shots
 
 
@@ -463,6 +470,22 @@ def generation_order(shots: list[dict]) -> list[int]:
             raise SystemExit("the film has shots that start from or end on each other")
         order.append(ready[0])
     return order
+
+
+def draw_caption(frames, text: str) -> None:
+    """Draws `text` on `frames`, in uint8 RGB, in place: centered near the bottom, in white letters outlined in black,
+    a fifth of the frame high, in the font that comes with Pillow."""
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    height, width = frames.shape[1:3]
+    font, stroke = ImageFont.load_default(size=height // 5), height // 64
+    left, _, right, bottom = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox((0, 0), text, font, stroke_width=stroke)
+    position = ((width - left - right) // 2, height - height // 12 - bottom)
+    for frame in frames:
+        image = Image.fromarray(frame)
+        ImageDraw.Draw(image).text(position, text, "white", font, stroke_width=stroke, stroke_fill="black")
+        frame[:] = np.asarray(image)
 
 
 def level_audio(audio, sample_rate: int):
@@ -487,8 +510,8 @@ def level_audio(audio, sample_rate: int):
 def edit_film(clips: list, shots: list[dict], sample_rate: int):
     """The frames and audio of the film of `shots`, of which `clips` holds the frames and audio: its shots one after the
     other, each without the frames it starts from, which repeat those of an earlier shot, and without its frames from
-    the keyframes it ends on, which a later shot repeats. Its sound has the background of its shots evened out (see
-    `level_audio`)."""
+    the keyframes it ends on, which a later shot repeats. A shot can have a caption, drawn on its frames from its start
+    to its end, in seconds into the shot. Its sound has the background of its shots evened out (see `level_audio`)."""
     import numpy as np
 
     frames, audio = [], []
@@ -496,7 +519,12 @@ def edit_film(clips: list, shots: list[dict], sample_rate: int):
         skip, stop = shot.get("from", {}).get("frames", 0), len(shot_frames)
         if "to" in shot:
             stop = (keyframe_index(len(shot_frames), shot["to"]["frames"]) - 1) * 8 + 1
-        frames.append(shot_frames[skip:stop])
+        kept = shot_frames[skip:stop]
+        if "caption" in shot:
+            first, last = (round(shot["caption"][key] * FPS) - skip for key in ("start", "end"))
+            kept = kept.copy()
+            draw_caption(kept[max(first, 0) : max(last, 0)], shot["caption"]["text"])
+        frames.append(kept)
         # The audio of a clip ends a little before its frames (32 ms with the vocoder of LTX-2.5): padded to their
         # length, each shot keeps the film in sync.
         offset, length = round(skip / FPS * sample_rate), round((stop - skip) / FPS * sample_rate)
