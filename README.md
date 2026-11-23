@@ -34,10 +34,10 @@ steps at 2048x1024.
 
 [`generate.py`](generate.py) writes the clip to `outputs/`, named after the
 demo and its size, such as `video-gen-demo-2048x1024`: an mp4 with its audio, 4
-of its frames as a png, and its frames and audio as an npz. `--prompt` and
-`--seed` set what it generates. With several prompts, it makes one clip per
-prompt, one after the other, without loading the models again: their names end
-with `-1`, `-2`...
+of its frames as a png and, with `--npz`, its frames and audio as an npz.
+`--prompt` and `--seed` set what it generates. With several prompts, it makes
+one clip per prompt, one after the other, without loading the models again:
+their names end with `-1`, `-2`...
 
 ## Films
 

@@ -10,7 +10,8 @@ and the decoder runs on all of their cores. Only rank 0 runs the pipeline, its o
 arguments of each transformer call and of the decode to the other ranks, which run their slices of the transformer on
 them and decode their frames, which rank 0 gathers. With --cpu, the whole pipeline runs on CPU.
 
-The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png, and its frames and audio to outputs/NAME.npz.
+The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png and, with --npz, its frames and audio to
+outputs/NAME.npz.
 NAME is video-gen-demo-WIDTHxHEIGHT by default, after the size of the clip, with -cpu on CPU. With several prompts,
 the process makes one clip per prompt, one after the other, and their names end with -1, -2...
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
@@ -25,7 +26,7 @@ FILM-WIDTHxHEIGHT by default, after the file of the film.
 
 Run with:
     ./run.sh generate.py [--cpu] [--prompt PROMPT... | --film FILM] [--seed SEED] [--name NAME] [--width WIDTH]
-        [--height HEIGHT] [--frames FRAMES] [--two-stage] [--tp TP] [--sp SP]
+        [--height HEIGHT] [--frames FRAMES] [--two-stage] [--tp TP] [--sp SP] [--npz]
 """
 from __future__ import annotations
 
@@ -399,7 +400,7 @@ def write_mp4(path: str, frames, audio, sample_rate: int) -> None:
         container.mux(audio_stream.encode())
 
 
-def save(frames, audio, sample_rate: int, name: str, npz: bool = True) -> None:
+def save(frames, audio, sample_rate: int, name: str, npz: bool = False) -> None:
     """Writes the clip of `frames`, in uint8 RGB, and `audio` to outputs/: NAME.mp4, NAME.png (4 of its frames) and,
     with `npz`, NAME.npz (its frames and audio)."""
     import numpy as np
@@ -485,6 +486,8 @@ def main() -> None:
     content.add_argument("--film", help="a JSON file of the shots of a film, which can start from the last frames of "
                          "an earlier shot (see read_film): the shots, made one after the other, then the film")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--npz", action="store_true", help="also write the frames and audio of each clip to "
+                        "NAME.npz")
     parser.add_argument("--name", help="the name of the outputs (default: video-gen-demo-WIDTHxHEIGHT, after the size "
                         "of the clip, or FILM-WIDTHxHEIGHT with --film, after its file, with -cpu on CPU), followed by "
                         "-1, -2... for each of several clips, or by -shot-1, -shot-2... for the shots of a film and "
@@ -566,11 +569,11 @@ def main() -> None:
             clip_name = f"{name}-shot-{i + 1}"
         else:
             clip_name = f"{name}-{i + 1}" if len(shots) > 1 else name
-        save(*clips[i], sample_rate, clip_name)
+        save(*clips[i], sample_rate, clip_name, npz=args.npz)
         log(f"wrote {os.path.join(OUTPUT_DIR, clip_name)}.mp4, {time.time() - t0:.0f} s after the start of the clip")
     if args.film:
         t0 = time.time()
-        save(*edit_film(clips, shots, sample_rate), sample_rate, f"{name}-full", npz=False)
+        save(*edit_film(clips, shots, sample_rate), sample_rate, f"{name}-full")
         log(f"wrote {os.path.join(OUTPUT_DIR, name)}-full.mp4, the film, in {time.time() - t0:.0f} s")
 
 
