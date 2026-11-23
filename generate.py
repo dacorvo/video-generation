@@ -311,7 +311,8 @@ def keyframe_index(num_frames: int, count: int) -> int:
 def generate(
     pipe, prompt: str, seed: int, width: int, height: int, num_frames: int, upsample_pipe=None, start=None, end=None
 ):
-    """The video, as frames in [0, 1], and the audio of the clip of `prompt`.
+    """The video, as a tensor of frames in [0, 1], (batch, frames, channels, height, width), and the audio of the clip
+    of `prompt`.
 
     With `upsample_pipe`, the clip follows the two-stage distilled recipe of the model card: `pipe` makes it at `width`
     x `height` as latents, `upsample_pipe` upscales them x2, and `pipe` denoises them again at twice the size, over
@@ -328,8 +329,13 @@ def generate(
         STAGE_2_DISTILLED_SIGMA_VALUES,
     )
 
+    # Otherwise each stage runs the text encoder again, on CPU.
+    prompt_embeds, prompt_attention_mask, _, _ = pipe.encode_prompt(
+        prompt=prompt, do_classifier_free_guidance=False, device=torch.device("cpu")
+    )
     settings = dict(
-        prompt=prompt,
+        prompt_embeds=prompt_embeds,
+        prompt_attention_mask=prompt_attention_mask,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
         num_frames=num_frames,
         frame_rate=FPS,
@@ -352,7 +358,7 @@ def generate(
         if end is not None:
             settings["conditions"].append(LTX2VideoCondition(frames=end, index=keyframe_index(num_frames, len(end))))
     if upsample_pipe is None:
-        return pipe(width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="np", **settings)
+        return pipe(width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="pt", **settings)
     t0 = time.time()
     latents, audio_latents = pipe(
         width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="latent", **settings
@@ -371,7 +377,7 @@ def generate(
         height=2 * height,
         sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
         noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
-        output_type="np",
+        output_type="pt",
         **settings,
     )
     log(f"stage 2: {time.time() - t0:.0f} s")
@@ -410,7 +416,8 @@ def save(frames, audio, sample_rate: int, name: str, npz: bool = False) -> None:
     path = os.path.join(OUTPUT_DIR, name)
     write_mp4(f"{path}.mp4", frames, audio, sample_rate)
     picks = np.linspace(0, len(frames) - 1, 4).round().astype(int)
-    Image.fromarray(np.concatenate(list(frames[picks]), axis=1)).save(f"{path}.png")
+    # With the default compression, the 4 frames take 3 s to write.
+    Image.fromarray(np.concatenate(list(frames[picks]), axis=1)).save(f"{path}.png", compress_level=1)
     if npz:
         np.savez(f"{path}.npz", video=frames, audio=audio)
 
@@ -526,7 +533,7 @@ def main() -> None:
     conditioned = any("from" in shot or "to" in shot for shot in shots)
     condition_pipe = load_condition_pipeline(pipe) if conditioned else None
     log(f"load: {time.time() - t0:.0f} s")
-    import numpy as np
+    import torch
 
     sample_rate = pipe.vocoder.config.output_sampling_rate
     # The frames, in uint8 RGB, and the audio of each clip, once made.
@@ -561,8 +568,10 @@ def main() -> None:
             # The other ranks return from `serve`.
             dist.broadcast_object_list([None], src=0, group=group)
         log(f"generation: {time.time() - t0:.0f} s, transformer calls: {', '.join(f'{c:.1f}' for c in calls)} s")
-        clips[i] = ((np.clip(video[0], 0, 1) * 255).round().astype(np.uint8), audio[0].float().cpu().numpy())
-        height, width = video[0].shape[1:3]
+        # On all the threads of torch, in place of numpy, which takes 5 s on one: the same rounding, the same bytes.
+        frames = video[0].float().mul_(255).round_().to(torch.uint8).permute(0, 2, 3, 1).contiguous().numpy()
+        clips[i] = (frames, audio[0].float().cpu().numpy())
+        height, width = frames.shape[1:3]
         stem = os.path.splitext(os.path.basename(args.film))[0] if args.film else "video-gen-demo"
         name = args.name or f"{stem}-{width}x{height}" + ("-cpu" if args.cpu else "")
         if args.film:
