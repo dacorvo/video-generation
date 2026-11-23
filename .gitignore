@@ -5,3 +5,5 @@ __pycache__/
 models/
 neff_cache/
 outputs/
+# Films, kept in the dacorvo/video-generation bucket.
+films/
