@@ -465,10 +465,30 @@ def generation_order(shots: list[dict]) -> list[int]:
     return order
 
 
+def level_audio(audio, sample_rate: int):
+    """`audio`, stereo, with its quiet parts raised toward -52 dBFS over half a second, by at most 18 dB, and with 3 dB
+    of headroom left under the loud sounds within 0.4 s of them. The model generates the sound of each shot of a film
+    on its own, its background at a level of its own, from almost silent to clearly audible."""
+    import numpy as np
+
+    hop = sample_rate // 100
+    count = -(-audio.shape[1] // hop)
+    hops = np.pad(audio, ((0, 0), (0, count * hop - audio.shape[1]))).reshape(2, count, hop)
+    power = (hops.astype(np.float64) ** 2).mean(axis=(0, 2))
+    level = 10 * np.log10(np.convolve(np.pad(power, 25, mode="edge"), np.ones(51) / 51, mode="valid") + 1e-12)
+    peak = np.lib.stride_tricks.sliding_window_view(np.pad(np.abs(hops).max(axis=(0, 2)), 40, mode="edge"), 81)
+    headroom = np.maximum(-3 - 20 * np.log10(peak.max(axis=1) + 1e-12), 0)
+    gain = np.minimum(np.clip(-52 - level, 0, 18), headroom)
+    gain = np.convolve(np.pad(gain, 10, mode="edge"), np.ones(21) / 21, mode="valid")
+    scale = np.interp(np.arange(audio.shape[1]), (np.arange(count) + 0.5) * hop, 10 ** (gain / 20))
+    return (audio * scale).astype(audio.dtype)
+
+
 def edit_film(clips: list, shots: list[dict], sample_rate: int):
     """The frames and audio of the film of `shots`, of which `clips` holds the frames and audio: its shots one after the
     other, each without the frames it starts from, which repeat those of an earlier shot, and without its frames from
-    the keyframes it ends on, which a later shot repeats."""
+    the keyframes it ends on, which a later shot repeats. Its sound has the background of its shots evened out (see
+    `level_audio`)."""
     import numpy as np
 
     frames, audio = [], []
@@ -482,7 +502,7 @@ def edit_film(clips: list, shots: list[dict], sample_rate: int):
         offset, length = round(skip / FPS * sample_rate), round((stop - skip) / FPS * sample_rate)
         shot_audio = shot_audio[:, offset : offset + length]
         audio.append(np.pad(shot_audio, ((0, 0), (0, length - shot_audio.shape[1]))))
-    return np.concatenate(frames), np.concatenate(audio, axis=1)
+    return np.concatenate(frames), level_audio(np.concatenate(audio, axis=1), sample_rate)
 
 
 def main() -> None:

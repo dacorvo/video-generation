@@ -77,7 +77,10 @@ picked among several:
 The number of frames is one more than a multiple of 8, as the VAE encodes the
 frames after the first by 8. The film leaves out the frames a shot starts
 from, which repeat the earlier shot, and the frames of a shot from its
-keyframes on, which the later shot repeats. In [`films/fox.json`](films/fox.json),
+keyframes on, which the later shot repeats. As the model generates the sound of
+each shot on its own, the background of one shot can be faint and the next one
+loud: the film raises its quiet parts toward a common level, and leaves its
+loud sounds as they are. In [`films/fox.json`](films/fox.json),
 shot 2 continues shot 1, shot 3 cuts to a raven, and shot 4 returns to the fox
 from the last frame of shot 2.
 
