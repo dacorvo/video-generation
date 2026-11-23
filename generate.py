@@ -418,7 +418,8 @@ def read_film(path: str, num_frames: int) -> list[dict]:
     """The shots of the film of the JSON file `path`, a list of shots of `num_frames` frames. Each has a "prompt", can
     start from the last frames of an earlier shot, {"from": {"shot": NUMBER, "frames": COUNT}}, which it then keeps as
     its first frames, and can end on the first frames of a later shot, {"to": {"shot": NUMBER, "frames": COUNT}}. As the
-    VAE encodes the frames after the first by 8, COUNT is one more than a multiple of 8."""
+    VAE encodes the frames after the first by 8, COUNT is one more than a multiple of 8. A shot can also have its own
+    "seed", in place of the seed of the film."""
     import json
 
     with open(path) as f:
@@ -436,6 +437,8 @@ def read_film(path: str, num_frames: int) -> list[dict]:
             number < end["shot"] <= len(shots) and 1 <= end["frames"] <= num_frames - 8 and end["frames"] % 8 == 1
         ):
             raise SystemExit(f"{path}: shot {number} can only end on the first 1, 9, 17... frames of a later shot")
+        if not isinstance(shot.get("seed", 0), int):
+            raise SystemExit(f"{path}: the seed of shot {number} is not an integer")
     return shots
 
 
@@ -541,7 +544,7 @@ def main() -> None:
         video, audio = generate(
             pipe if start is None and end is None else condition_pipe,
             shot["prompt"],
-            args.seed,
+            shot.get("seed", args.seed),
             args.width,
             args.height,
             args.frames,

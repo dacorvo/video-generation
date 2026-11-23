@@ -67,6 +67,13 @@ later shot first:
 {"prompt": "...", "to": {"shot": 3, "frames": 25}}
 ```
 
+A shot can have its own seed, in place of `--seed`, to keep the take of the shot
+picked among several:
+
+```json
+{"prompt": "...", "seed": 3}
+```
+
 The number of frames is one more than a multiple of 8, as the VAE encodes the
 frames after the first by 8. The film leaves out the frames a shot starts
 from, which repeat the earlier shot, and the frames of a shot from its
