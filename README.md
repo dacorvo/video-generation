@@ -42,10 +42,14 @@ their names end with `-1`, `-2`...
 ## Films
 
 With `--film`, [`generate.py`](generate.py) makes the shots of a film in the
-same process, then the film, its shots edited one after the other:
+same process, then the film, its shots edited one after the other. The films
+made with it, their JSON files and their mp4s, are in the
+[dacorvo/video-generation](https://huggingface.co/buckets/dacorvo/video-generation)
+bucket. For instance, for the goat film:
 
 ```bash
-./run.sh generate.py --two-stage --film films/fox.json  # outputs/fox-2048x1024-full.mp4, and its shots fox-2048x1024-shot-1.mp4...
+curl -LO https://huggingface.co/buckets/dacorvo/video-generation/resolve/goat.json
+./run.sh generate.py --two-stage --film goat.json  # outputs/goat-2048x1024-full.mp4, and its shots goat-2048x1024-shot-1.mp4...
 ```
 
 A film is a JSON list of shots, each a prompt. A shot can start from the last
@@ -94,9 +98,12 @@ from, which repeat the earlier shot, and the frames of a shot from its
 keyframes on, which the later shot repeats. As the model generates the sound of
 each shot on its own, the background of one shot can be faint and the next one
 loud: the film raises its quiet parts toward a common level, and leaves its
-loud sounds as they are. In [`films/fox.json`](films/fox.json),
-shot 2 continues shot 1, shot 3 cuts to a raven, and shot 4 returns to the fox
-from the last frame of shot 2.
+loud sounds as they are.
+
+In the bucket, in `fox.json`, shot 2 continues shot 1, shot 3 cuts to a raven,
+and shot 4 returns to the fox from the last frame of shot 2. In `goat.json`,
+the climb ends on the first frames of the scream, the eye is an insert of 3.5 s
+trimmed from its shot, and the scream has a caption.
 
 ## Checks
 
