@@ -6,7 +6,7 @@ latents, the latent upsampler upscales them x2 on CPU, and the pipeline denoises
 Neuron, `parallel` splits the transformer, and the decoder of the video VAE by frames, over the first --tp NeuronCores
 of NEURON_RT_VISIBLE_CORES, one torch.distributed rank per core, and torch.compile(backend="neuron") compiles the
 transformer's blocks and the decoder. With --sp, --sp groups of --tp cores split the video tokens of the transformer,
-and the decoder runs on the first 16 of their cores. Only rank 0 runs the pipeline, its other models on CPU. It sends the
+and the decoder runs on the last 16 of their cores. Only rank 0 runs the pipeline, its other models on CPU. It sends the
 arguments of each transformer call and of the decode to the other ranks, which run their slices of the transformer on
 them and decode their frames into shared memory, where rank 0 reads them. With --cpu, the whole pipeline runs on CPU.
 
@@ -114,6 +114,13 @@ def decode_on_neuron(vae):
     return call
 
 
+def decode_ranks(world_size: int) -> range:
+    """The ranks, of `world_size`, that decode the frames of a clip: the last `DECODE_RANKS`. Over more ranks, rank 0,
+    which runs the pipeline, then decodes none: it makes the audio of the clip on CPU while they decode its frames.
+    Decoding its own frames meanwhile, it took 1.3 s for the audio decode, against 0.1 s."""
+    return range(max(0, world_size - DECODE_RANKS), world_size)
+
+
 def to_rgb(video):
     """The frames of `video`, as the video VAE decodes them, (batch, channels, frames, height, width) in [-1, 1], in
     uint8 RGB, (batch, frames, height, width, channels): mapped to [0, 1] as the video processor of diffusers maps them,
@@ -145,23 +152,23 @@ def write_frames(frames, vae, latents, shared) -> None:
 
     import parallel
 
-    ranks = min(dist.get_world_size(), DECODE_RANKS)
-    start = parallel.frame_ranges(latents.shape[2], ranks)[dist.get_rank()][0]
+    ranks = decode_ranks(dist.get_world_size())
+    start = parallel.frame_ranges(latents.shape[2], len(ranks))[dist.get_rank() - ranks.start][0]
     offset = 0 if start == 0 else (start - 1) * vae.temporal_compression_ratio + 1
     shared[:, offset : offset + frames.shape[2]] = to_rgb(frames)
 
 
 def split_decode(vae, group) -> None:
-    """Makes the video VAE `vae`, split by frames over the NeuronCores of the first `DECODE_RANKS` ranks of the gloo
-    group `group`, decode its frames on the core of this rank, after it sends the arguments of the decode to the other
-    ranks, which decode theirs (`serve`), all of them into `shared_frames`. Its decode returns a tuple, as with
+    """Makes the video VAE `vae`, split by frames over the NeuronCores of the ranks of the gloo group `group` that
+    `decode_ranks` returns, send the arguments of the decode to the other ranks, which decode their frames (`serve`),
+    and decode its own if it is one of them, all into `shared_frames`. Its decode returns a tuple, as with
     `return_dict=False`, of a future of the frames in uint8 RGB (see `to_rgb`): the pipeline makes the audio of the clip
     on CPU while the cores decode its frames."""
     import concurrent.futures
 
     import torch.distributed as dist
 
-    decode = decode_on_neuron(vae)
+    decode = decode_on_neuron(vae) if dist.get_rank() in decode_ranks(dist.get_world_size()) else None
     # A single thread, which decodes the clips in order.
     pool = concurrent.futures.ThreadPoolExecutor(1)
 
@@ -175,7 +182,8 @@ def split_decode(vae, group) -> None:
         os.unlink(path)
 
         def finish():
-            write_frames(decode(latents, *args, **kwargs), vae, latents, frames)
+            if decode is not None:
+                write_frames(decode(latents, *args, **kwargs), vae, latents, frames)
             # The other ranks have written their frames once they all answer.
             dist.gather_object(None, [None] * dist.get_world_size(group), dst=0, group=group)
             # Copied out of shared memory, which the frames of the shots of a long film would fill.
@@ -210,14 +218,14 @@ def timed(transformer, calls: list, group=None, sp_group=None) -> None:
 
 def serve(transformer, vae, group, sp_group=None) -> None:
     """Runs on the NeuronCore of this rank, on the arguments that rank 0 sends over `group`, the slice of `transformer`
-    of this rank for each transformer call (see `timed`), and on the first `DECODE_RANKS` ranks, the decoder of `vae` on
+    of this rank for each transformer call (see `timed`), and on the ranks of `decode_ranks`, the decoder of `vae` on
     the frames of this rank for each decode, which it writes to `shared_frames` (see `split_decode`), until it sends
     None. `sp_group` is the sequence-parallel group of this rank, if any (see `on_neuron`)."""
     import torch
     import torch.distributed as dist
 
     forward = on_neuron(transformer, sp_group)
-    decode = decode_on_neuron(vae) if dist.get_rank() < DECODE_RANKS else None
+    decode = decode_on_neuron(vae) if dist.get_rank() in decode_ranks(dist.get_world_size()) else None
     while True:
         message = [None]
         dist.broadcast_object_list(message, src=0, group=group)
@@ -281,7 +289,7 @@ def pack_parameters(module, alignment: int = 4096, max_buffer: int = 2**30) -> N
 
 def load_models(sp: int = 1):
     """The slice of the LTX-2.5 transformer of this rank, split over the NeuronCores of all ranks, the video VAE, its
-    decoder split over those of the first `DECODE_RANKS` ranks, a gloo group of all ranks, which sends the arguments of
+    decoder split over those of the ranks of `decode_ranks`, a gloo group of all ranks, which sends the arguments of
     their calls, and the sequence-parallel group of this rank, or None.
 
     With `sp` above 1, `sp` groups of ranks, each on its own cores, split the video tokens of the transformer, and the
@@ -306,8 +314,9 @@ def load_models(sp: int = 1):
     pack_parameters(transformer)
     vae = AutoencoderKLLTX2Video.from_pretrained(os.path.join(MODEL_DIR, "vae"), dtype=torch.bfloat16)
     # Every rank takes part in creating the group.
-    decode_group = dist.group.WORLD if world_size <= DECODE_RANKS else dist.new_group(list(range(DECODE_RANKS)))
-    if dist.get_rank() < DECODE_RANKS:
+    ranks = decode_ranks(world_size)
+    decode_group = dist.group.WORLD if len(ranks) == world_size else dist.new_group(list(ranks))
+    if dist.get_rank() in ranks:
         # The pipeline normalizes the latents on the host with the other tensors of the VAE.
         vae.decoder.to(f"neuron:{torch.neuron.current_device()}")
         pack_parameters(vae.decoder)
