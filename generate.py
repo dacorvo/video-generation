@@ -6,9 +6,9 @@ latents, the latent upsampler upscales them x2 on CPU, and the pipeline denoises
 Neuron, `parallel` splits the transformer, and the decoder of the video VAE by frames, over the first --tp NeuronCores
 of NEURON_RT_VISIBLE_CORES, one torch.distributed rank per core, and torch.compile(backend="neuron") compiles the
 transformer's blocks and the decoder. With --sp, --sp groups of --tp cores split the video tokens of the transformer,
-and the decoder runs on all of their cores. Only rank 0 runs the pipeline, its other models on CPU. It sends the
+and the decoder runs on the first 16 of their cores. Only rank 0 runs the pipeline, its other models on CPU. It sends the
 arguments of each transformer call and of the decode to the other ranks, which run their slices of the transformer on
-them and decode their frames, which rank 0 gathers. With --cpu, the whole pipeline runs on CPU.
+them and decode their frames into shared memory, where rank 0 reads them. With --cpu, the whole pipeline runs on CPU.
 
 The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png and, with --npz, its frames and audio to
 outputs/NAME.npz.
@@ -42,6 +42,9 @@ MODEL_DIR = os.path.join(launch.WORK_DIR, "models", "LTX-2.5-Diffusers")
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 # On 2 NeuronCores, the transformer ran out of memory at 960x544 for 10 s.
 TP = 4
+# The video decoder splits the latent frames of a clip over at most this many ranks: a 10 s clip has 31, which would
+# leave a rank without any over 32 ranks.
+DECODE_RANKS = 16
 RANK = int(os.environ.get("RANK", "0"))
 # By default, 10 seconds at 1024x512. LTX-2.5 takes one frame more than a multiple of 8. A frame of 1024x512 has 512
 # video tokens: their count stays a multiple of 128, so torch-neuronx runs the video self-attention with its NKI flash
@@ -111,20 +114,65 @@ def decode_on_neuron(vae):
     return call
 
 
-def split_decode(vae, group) -> None:
-    """Makes the video VAE `vae`, split by frames over the NeuronCores of the ranks of the gloo group `group`, decode its
-    frames on the core of this rank, after it sends the arguments of the decode to the other ranks, which decode theirs
-    (`serve`), then gather them. Its decode returns a tuple, as with `return_dict=False`."""
+def to_rgb(video):
+    """The frames of `video`, as the video VAE decodes them, (batch, channels, frames, height, width) in [-1, 1], in
+    uint8 RGB, (batch, frames, height, width, channels): mapped to [0, 1] as the video processor of diffusers maps them,
+    in the dtype of `video`, then rounded to the nearest integer in fp32."""
     import torch
+
+    return (video * 0.5 + 0.5).clamp(0, 1).float().mul_(255).round_().to(torch.uint8).permute(0, 2, 3, 4, 1)
+
+
+def shared_frames(path: str, vae, latents):
+    """The frames that `vae` decodes from `latents`, in uint8 RGB (see `to_rgb`), in the file `path` in shared memory,
+    which it creates if needed. Each rank of the decode writes its frames there, and rank 0 reads them all: pickled
+    through a gloo group, the frames of a clip at 2048x1024 took 6.6 s to reach rank 0, and their conversion to uint8
+    took 2 s more on rank 0 alone."""
+    import math
+
+    import torch
+
+    batch, _, frames, height, width = latents.shape
+    temporal, spatial = vae.temporal_compression_ratio, vae.spatial_compression_ratio
+    shape = (batch, (frames - 1) * temporal + 1, height * spatial, width * spatial, 3)
+    return torch.from_file(path, shared=True, size=math.prod(shape), dtype=torch.uint8).view(shape)
+
+
+def write_frames(frames, vae, latents, shared) -> None:
+    """Writes `frames`, those that this rank decodes from `latents`, to their place in `shared`, the frames of all the
+    ranks (see `shared_frames`)."""
+    import torch.distributed as dist
+
+    import parallel
+
+    ranks = min(dist.get_world_size(), DECODE_RANKS)
+    start = parallel.frame_ranges(latents.shape[2], ranks)[dist.get_rank()][0]
+    offset = 0 if start == 0 else (start - 1) * vae.temporal_compression_ratio + 1
+    shared[:, offset : offset + frames.shape[2]] = to_rgb(frames)
+
+
+def split_decode(vae, group) -> None:
+    """Makes the video VAE `vae`, split by frames over the NeuronCores of the first `DECODE_RANKS` ranks of the gloo
+    group `group`, decode its frames on the core of this rank, after it sends the arguments of the decode to the other
+    ranks, which decode theirs (`serve`), all of them into `shared_frames`. Its decode returns a tuple, as with
+    `return_dict=False`, of the frames in uint8 RGB (see `to_rgb`)."""
     import torch.distributed as dist
 
     decode = decode_on_neuron(vae)
 
-    def call(*args, **kwargs):
-        dist.broadcast_object_list([("decode", args, kwargs)], src=0, group=group)
-        frames = [None] * dist.get_world_size(group)
-        dist.gather_object(decode(*args, **kwargs), frames, dst=0, group=group)
-        return (torch.cat(frames, dim=2),)
+    def call(latents, *args, **kwargs):
+        path = f"/dev/shm/ltx2-frames-{os.getpid()}-{time.time_ns()}"
+        # Created before the other ranks open it.
+        frames = shared_frames(path, vae, latents)
+        dist.broadcast_object_list([("decode", (latents, *args), kwargs, path)], src=0, group=group)
+        # Once all the ranks map the file, its name can go: then the file cannot outlive a decode that fails.
+        dist.barrier(group=group)
+        os.unlink(path)
+        write_frames(decode(latents, *args, **kwargs), vae, latents, frames)
+        # The other ranks have written their frames once they all answer.
+        dist.gather_object(None, [None] * dist.get_world_size(group), dst=0, group=group)
+        # Copied out of shared memory, which the frames of the shots of a long film would fill.
+        return (frames.clone(),)
 
     vae.decode = call
 
@@ -153,22 +201,26 @@ def timed(transformer, calls: list, group=None, sp_group=None) -> None:
 
 def serve(transformer, vae, group, sp_group=None) -> None:
     """Runs on the NeuronCore of this rank, on the arguments that rank 0 sends over `group`, the slice of `transformer`
-    of this rank for each transformer call (see `timed`), and the decoder of `vae` on the frames of this rank for each
-    decode, which it then sends to rank 0 (see `split_decode`), until it sends None. `sp_group` is the
-    sequence-parallel group of this rank, if any (see `on_neuron`)."""
+    of this rank for each transformer call (see `timed`), and on the first `DECODE_RANKS` ranks, the decoder of `vae` on
+    the frames of this rank for each decode, which it writes to `shared_frames` (see `split_decode`), until it sends
+    None. `sp_group` is the sequence-parallel group of this rank, if any (see `on_neuron`)."""
     import torch
     import torch.distributed as dist
 
     forward = on_neuron(transformer, sp_group)
-    decode = decode_on_neuron(vae)
+    decode = decode_on_neuron(vae) if dist.get_rank() < DECODE_RANKS else None
     while True:
         message = [None]
         dist.broadcast_object_list(message, src=0, group=group)
         if message[0] is None:
             return
-        kind, args, kwargs = message[0]
+        kind, args, kwargs, *path = message[0]
         if kind == "decode":
-            dist.gather_object(decode(*args, **kwargs), None, dst=0, group=group)
+            shared = shared_frames(*path, vae, args[0]) if decode is not None else None
+            dist.barrier(group=group)
+            if decode is not None:
+                write_frames(decode(*args, **kwargs), vae, args[0], shared)
+            dist.gather_object(None, None, dst=0, group=group)
             continue
         # Without grad, as the pipeline runs on rank 0: with grad, this rank would compile another graph, which keeps
         # the activations for a backward pass.
@@ -219,9 +271,9 @@ def pack_parameters(module, alignment: int = 4096, max_buffer: int = 2**30) -> N
 
 
 def load_models(sp: int = 1):
-    """The slice of the LTX-2.5 transformer of this rank, and the video VAE, its decoder on the NeuronCore of this rank,
-    both split over the NeuronCores of all ranks, a gloo group of all ranks, which sends the arguments of their calls,
-    and the sequence-parallel group of this rank, or None.
+    """The slice of the LTX-2.5 transformer of this rank, split over the NeuronCores of all ranks, the video VAE, its
+    decoder split over those of the first `DECODE_RANKS` ranks, a gloo group of all ranks, which sends the arguments of
+    their calls, and the sequence-parallel group of this rank, or None.
 
     With `sp` above 1, `sp` groups of ranks, each on its own cores, split the video tokens of the transformer, and the
     ranks of each group split its weights.
@@ -244,10 +296,13 @@ def load_models(sp: int = 1):
     transformer = parallel.load_transformer(os.path.join(MODEL_DIR, "transformer"), tp_mesh, sp_group)
     pack_parameters(transformer)
     vae = AutoencoderKLLTX2Video.from_pretrained(os.path.join(MODEL_DIR, "vae"), dtype=torch.bfloat16)
-    # The pipeline normalizes the latents on the host with the other tensors of the VAE.
-    vae.decoder.to(f"neuron:{torch.neuron.current_device()}")
-    pack_parameters(vae.decoder)
-    parallel.split_by_frames(vae, dist.group.WORLD)
+    # Every rank takes part in creating the group.
+    decode_group = dist.group.WORLD if world_size <= DECODE_RANKS else dist.new_group(list(range(DECODE_RANKS)))
+    if dist.get_rank() < DECODE_RANKS:
+        # The pipeline normalizes the latents on the host with the other tensors of the VAE.
+        vae.decoder.to(f"neuron:{torch.neuron.current_device()}")
+        pack_parameters(vae.decoder)
+        parallel.split_by_frames(vae, decode_group)
     return transformer, vae, dist.new_group(backend="gloo"), sp_group
 
 
@@ -302,6 +357,11 @@ def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=
     reuse_connectors(pipe)
     if group is not None:
         split_decode(pipe.vae, group)
+    else:
+        decode = pipe.vae.decode
+        pipe.vae.decode = lambda *args, **kwargs: (to_rgb(decode(*args, **kwargs)[0]),)
+    # The decode returns the frames in uint8 RGB already.
+    pipe.video_processor.postprocess_video = lambda video, output_type: video
     return pipe
 
 
@@ -323,7 +383,9 @@ def load_condition_pipeline(pipe):
     from diffusers import LTX2ConditionPipeline
 
     # `from_pipe` would cast the models to its dtype, fp32 by default.
-    return on_host(LTX2ConditionPipeline)(**pipe.components)
+    condition_pipe = on_host(LTX2ConditionPipeline)(**pipe.components)
+    condition_pipe.video_processor.postprocess_video = pipe.video_processor.postprocess_video
+    return condition_pipe
 
 
 def keyframe_index(num_frames: int, count: int) -> int:
@@ -360,8 +422,8 @@ def encode_prompt(pipe, prompt: str, length: int = 1024):
 def generate(
     pipe, prompt: str, seed: int, width: int, height: int, num_frames: int, upsample_pipe=None, start=None, end=None
 ):
-    """The video, as a tensor of frames in [0, 1], (batch, frames, channels, height, width), and the audio of the clip
-    of `prompt`.
+    """The video, as a tensor of frames in uint8 RGB, (batch, frames, height, width, channels), and the audio of the
+    clip of `prompt`.
 
     With `upsample_pipe`, the clip follows the two-stage distilled recipe of the model card: `pipe` makes it at `width`
     x `height` as latents, `upsample_pipe` upscales them x2, and `pipe` denoises them again at twice the size, over
@@ -634,8 +696,6 @@ def main() -> None:
     conditioned = any("from" in shot or "to" in shot for shot in shots)
     condition_pipe = load_condition_pipeline(pipe) if conditioned else None
     log(f"load: {time.time() - t0:.0f} s")
-    import torch
-
     sample_rate = pipe.vocoder.config.output_sampling_rate
     # The frames, in uint8 RGB, and the audio of each clip, once made.
     clips = [None] * len(shots)
@@ -669,8 +729,7 @@ def main() -> None:
             # The other ranks return from `serve`.
             dist.broadcast_object_list([None], src=0, group=group)
         log(f"generation: {time.time() - t0:.0f} s, transformer calls: {', '.join(f'{c:.1f}' for c in calls)} s")
-        # On all the threads of torch, in place of numpy, which takes 5 s on one: the same rounding, the same bytes.
-        frames = video[0].float().mul_(255).round_().to(torch.uint8).permute(0, 2, 3, 1).contiguous().numpy()
+        frames = video[0].numpy()
         clips[i] = (frames, audio[0].float().cpu().numpy())
         height, width = frames.shape[1:3]
         stem = os.path.splitext(os.path.basename(args.film))[0] if args.film else "video-gen-demo"
