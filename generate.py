@@ -555,20 +555,28 @@ def write_mp4(path: str, frames, audio, sample_rate: int) -> None:
         container.mux(audio_stream.encode())
 
 
-def save(frames, audio, sample_rate: int, name: str, npz: bool = False) -> None:
-    """Writes the clip of `frames`, in uint8 RGB, and `audio` to outputs/: NAME.mp4, NAME.png (4 of its frames) and,
-    with `npz`, NAME.npz (its frames and audio)."""
+def save(frames, audio, sample_rate: int, name: str, npz: bool = False):
+    """Writes the clip of `frames`, in uint8 RGB, and `audio` to outputs/: NAME.mp4, then, in the thread it returns,
+    NAME.png (4 of its frames) and, with `npz`, NAME.npz (its frames and audio), which the clip does not wait for."""
+    import threading
+
     import numpy as np
     from PIL import Image
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, name)
     write_mp4(f"{path}.mp4", frames, audio, sample_rate)
-    picks = np.linspace(0, len(frames) - 1, 4).round().astype(int)
-    # With the default compression, the 4 frames take 3 s to write.
-    Image.fromarray(np.concatenate(list(frames[picks]), axis=1)).save(f"{path}.png", compress_level=1)
-    if npz:
-        np.savez(f"{path}.npz", video=frames, audio=audio)
+
+    def write_others():
+        picks = np.linspace(0, len(frames) - 1, 4).round().astype(int)
+        # With the default compression, the 4 frames take 3 s to write.
+        Image.fromarray(np.concatenate(list(frames[picks]), axis=1)).save(f"{path}.png", compress_level=1)
+        if npz:
+            np.savez(f"{path}.npz", video=frames, audio=audio)
+
+    writer = threading.Thread(target=write_others)
+    writer.start()
+    return writer
 
 
 def read_film(path: str, num_frames: int) -> list[dict]:
@@ -742,6 +750,8 @@ def main() -> None:
     sample_rate = pipe.vocoder.config.output_sampling_rate
     # The frames, in uint8 RGB, and the audio of each clip, once made.
     clips = [None] * len(shots)
+    # The threads that write the png and npz of the clips.
+    writers = []
     for i in order:
         shot = shots[i]
         calls.clear()
@@ -781,12 +791,14 @@ def main() -> None:
             clip_name = f"{name}-shot-{i + 1}"
         else:
             clip_name = f"{name}-{i + 1}" if len(shots) > 1 else name
-        save(*clips[i], sample_rate, clip_name, npz=args.npz)
+        writers.append(save(*clips[i], sample_rate, clip_name, npz=args.npz))
         log(f"wrote {os.path.join(OUTPUT_DIR, clip_name)}.mp4, {time.time() - t0:.0f} s after the start of the clip")
     if args.film:
         t0 = time.time()
-        save(*edit_film(clips, shots, sample_rate), sample_rate, f"{name}-full")
+        writers.append(save(*edit_film(clips, shots, sample_rate), sample_rate, f"{name}-full"))
         log(f"wrote {os.path.join(OUTPUT_DIR, name)}-full.mp4, the film, in {time.time() - t0:.0f} s")
+    for writer in writers:
+        writer.join()
 
 
 if __name__ == "__main__":
