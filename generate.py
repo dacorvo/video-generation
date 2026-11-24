@@ -266,6 +266,27 @@ def on_host(pipeline_class):
     return HostPipeline
 
 
+def reuse_connectors(pipe) -> None:
+    """Makes the text connectors of `pipe` return their last outputs again on the same arguments: both stages of a clip
+    run them on the embeddings of its prompt, for 1 s on CPU each time."""
+    import torch
+
+    forward = pipe.connectors.forward
+    last = {}
+
+    def call(embeds, mask, *args, **kwargs):
+        if not (
+            "outputs" in last
+            and last["options"] == (args, kwargs)
+            and torch.equal(last["embeds"], embeds)
+            and torch.equal(last["mask"], mask)
+        ):
+            last.update(embeds=embeds, mask=mask, options=(args, kwargs), outputs=forward(embeds, mask, *args, **kwargs))
+        return last["outputs"]
+
+    pipe.connectors.forward = call
+
+
 def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=None):
     """The distilled LTX-2.5 pipeline in bf16, its tensors on the host. Its transformer and video VAE run on CPU, or
     are `transformer` and `vae` on Neuron, with `group` and `sp_group`, as `load_models` returns them."""
@@ -278,6 +299,7 @@ def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=
         MODEL_DIR, dtype=torch.bfloat16, processor=None, prompt_enhancer=None, **components
     )
     timed(pipe.transformer, calls, group, sp_group)
+    reuse_connectors(pipe)
     if group is not None:
         split_decode(pipe.vae, group)
     return pipe
