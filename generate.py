@@ -311,6 +311,30 @@ def keyframe_index(num_frames: int, count: int) -> int:
     return (num_frames - 1) // 8 - (count - 1) // 8
 
 
+def encode_prompt(pipe, prompt: str, length: int = 1024):
+    """The embeddings of `prompt` by the text encoder of `pipe` and their attention mask, as its `encode_prompt` makes
+    them on the prompt padded on the left to `length` tokens, but with the text encoder run on the tokens of the prompt
+    only, at the positions they take after the padding: the connectors of the pipeline replace the embeddings of the
+    padding with registers, and on CPU, the text encoder took 3.4 s on the 1024 tokens."""
+    import torch
+
+    tokens = pipe.tokenizer(
+        prompt.strip(), truncation=True, max_length=length, add_special_tokens=True, return_tensors="pt"
+    ).input_ids
+    count = tokens.shape[1]
+    with torch.no_grad():
+        states = pipe.text_encoder(
+            input_ids=tokens,
+            attention_mask=torch.ones_like(tokens),
+            position_ids=torch.arange(length - count, length).unsqueeze(0),
+            output_hidden_states=True,
+        ).hidden_states
+    embeds = torch.nn.functional.pad(torch.stack(states, dim=-1).flatten(2, 3), (0, 0, length - count, 0))
+    mask = torch.zeros(1, length, dtype=torch.long)
+    mask[:, length - count :] = 1
+    return embeds.to(pipe.text_encoder.dtype), mask
+
+
 def generate(
     pipe, prompt: str, seed: int, width: int, height: int, num_frames: int, upsample_pipe=None, start=None, end=None
 ):
@@ -333,9 +357,7 @@ def generate(
     )
 
     # Otherwise each stage runs the text encoder again, on CPU.
-    prompt_embeds, prompt_attention_mask, _, _ = pipe.encode_prompt(
-        prompt=prompt, do_classifier_free_guidance=False, device=torch.device("cpu")
-    )
+    prompt_embeds, prompt_attention_mask = encode_prompt(pipe, prompt)
     settings = dict(
         prompt_embeds=prompt_embeds,
         prompt_attention_mask=prompt_attention_mask,
