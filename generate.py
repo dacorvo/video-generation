@@ -12,7 +12,8 @@ them and decode their frames into shared memory, where rank 0 reads them. With -
 
 What to generate is a JSON file of shots, each with a name and a prompt (see read_shots), which the process makes one
 after the other. A shot can start from an image, such as a frame of the camera of a robot or of a car, which the
-condition pipeline of diffusers keeps as its first frame: the prompt says what happens next. A shot can also start from
+condition pipeline of diffusers keeps as its first frame: the prompt says what happens next. From the last frames of a
+video, such as the last second a camera filmed, it also takes the speed of what moves in it. A shot can also start from
 the last frames of an earlier shot, which the condition pipeline keeps as its first frames. From the last frame of a
 shot, it returns to its subject after a cut. From its last second, it continues its motion. A shot can also end on the
 first frames of a later shot, which the condition pipeline takes as keyframes: it then leads into that shot, which the
@@ -616,11 +617,12 @@ def save(frames, audio, sample_rate: int, name: str, npz: bool = False):
 def read_shots(path: str, num_frames: int) -> list[dict]:
     """The shots of the JSON file `path`, a list of shots of `num_frames` frames. Each has a "name", which ends the names
     of its outputs and by which other shots refer to it, and a "prompt". It can start from an image, {"from": {"image":
-    FILE}}, which it then keeps as its first frame, or from the last frames of an earlier shot, {"from": {"shot": NAME,
-    "frames": COUNT}}, which it then keeps as its first frames, and can end on the first frames of a later shot, {"to":
-    {"shot": NAME, "frames": COUNT}}. FILE is relative to the directory of `path`, and comes back joined to it. As the
-    VAE encodes the frames after the first by 8, COUNT is one more than a multiple of 8. A shot can also have its own
-    "seed", in place of the seed of the process."""
+    FILE}}, which it then keeps as its first frame, from the last frames of a video at FPS, {"from": {"video": FILE,
+    "frames": COUNT}}, or from the last frames of an earlier shot, {"from": {"shot": NAME, "frames": COUNT}}, which it
+    then keeps as its first frames, and can end on the first frames of a later shot, {"to": {"shot": NAME, "frames":
+    COUNT}}. FILE is relative to the directory of `path`, and comes back joined to it. As the VAE encodes the frames
+    after the first by 8, COUNT is one more than a multiple of 8. A shot can also have its own "seed", in place of the
+    seed of the process."""
     import json
     import re
 
@@ -640,12 +642,31 @@ def read_shots(path: str, num_frames: int) -> list[dict]:
     position = {name: i for i, name in enumerate(names)}
     for i, shot in enumerate(shots):
         name, start, end = shot["name"], shot.get("from"), shot.get("to")
-        if start is not None and "image" in start:
-            if not isinstance(start["image"], str):
-                raise SystemExit(f"{path}: the image of shot {name} is not a path")
-            start["image"] = os.path.join(os.path.dirname(path), start["image"])
-            if not os.path.isfile(start["image"]):
-                raise SystemExit(f"{path}: shot {name} starts from {start['image']}, which is not a file")
+        if start is not None and ("image" in start or "video" in start):
+            key = "image" if "image" in start else "video"
+            if not isinstance(start[key], str):
+                raise SystemExit(f"{path}: the {key} of shot {name} is not a path")
+            start[key] = os.path.join(os.path.dirname(path), start[key])
+            if not os.path.isfile(start[key]):
+                raise SystemExit(f"{path}: shot {name} starts from {start[key]}, which is not a file")
+            if key == "video":
+                import av
+
+                with av.open(start["video"]) as container:
+                    stream = container.streams.video[0]
+                    rate, count = float(stream.average_rate), stream.frames
+                # At another rate, the frames would show the shot a speed it does not have.
+                if rate != FPS:
+                    raise SystemExit(f"{path}: shot {name} starts from {start['video']}, at {rate} fps, not {FPS}")
+                if not (
+                    isinstance(start.get("frames"), int)
+                    and 1 <= start["frames"] <= min(count, num_frames)
+                    and start["frames"] % 8 == 1
+                ):
+                    raise SystemExit(
+                        f"{path}: shot {name} can only start from the last 1, 9, 17... frames of {start['video']}, "
+                        f"not {start.get('frames')}"
+                    )
         elif start is not None and not (
             position.get(start.get("shot"), i) < i
             and isinstance(start.get("frames"), int)
@@ -743,7 +764,8 @@ def edit_film(clips: list, shots: list[dict], sample_rate: int):
 
     frames, audio = [], []
     for (shot_frames, shot_audio), shot in zip(clips, shots):
-        skip, stop = shot.get("from", {}).get("frames", 0), len(shot_frames)
+        start = shot.get("from", {})
+        skip, stop = start["frames"] if "shot" in start else 0, len(shot_frames)
         if "to" in shot:
             stop = (keyframe_index(len(shot_frames), shot["to"]["frames"]) - 1) * 8 + 1
         if "trim" in shot:
@@ -829,6 +851,15 @@ def main() -> None:
             # In uint8 RGB, as the frames of a clip: the condition pipeline scales the image to cover each stage and
             # crops its middle.
             start = np.asarray(Image.open(shot["from"]["image"]).convert("RGB"))[None]
+        elif "video" in shot.get("from", {}):
+            import av
+            import numpy as np
+
+            count = shot["from"]["frames"]
+            log(f"shot {shot['name']}: starts from the last {count} frames of {shot['from']['video']}")
+            with av.open(shot["from"]["video"]) as container:
+                frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(container.streams.video[0])]
+            start = np.stack(frames[-count:])
         elif "from" in shot:
             source, count = shot["from"]["shot"], shot["from"]["frames"]
             log(f"shot {shot['name']}: starts from the last {count} frames of shot {source}")

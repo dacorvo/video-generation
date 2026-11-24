@@ -72,9 +72,12 @@ A shot can start from frames, which it keeps as its first frames:
   continues its motion.
 - From an image, `"from": {"image": "frame.png"}`, such as a frame of a camera:
   the prompt says what happens next.
+- From the last frames of a video at 24 frames per second,
+  `"from": {"video": "start.mp4", "frames": 25}`, such as the last second a
+  camera filmed: the shot also takes the speed of what moves in it.
 
-The path of an image is relative to the JSON file. The pipeline scales it to
-cover the clip and keeps its middle.
+The paths of images and videos are relative to the JSON file. The pipeline
+scales them to cover the clip and keeps their middle.
 
 A shot can end on the first frames of a later shot,
 `"to": {"shot": "scream", "frames": 9}`, which the pipeline takes as keyframes,
