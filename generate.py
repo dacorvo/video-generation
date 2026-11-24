@@ -155,10 +155,15 @@ def split_decode(vae, group) -> None:
     """Makes the video VAE `vae`, split by frames over the NeuronCores of the first `DECODE_RANKS` ranks of the gloo
     group `group`, decode its frames on the core of this rank, after it sends the arguments of the decode to the other
     ranks, which decode theirs (`serve`), all of them into `shared_frames`. Its decode returns a tuple, as with
-    `return_dict=False`, of the frames in uint8 RGB (see `to_rgb`)."""
+    `return_dict=False`, of a future of the frames in uint8 RGB (see `to_rgb`): the pipeline makes the audio of the clip
+    on CPU while the cores decode its frames."""
+    import concurrent.futures
+
     import torch.distributed as dist
 
     decode = decode_on_neuron(vae)
+    # A single thread, which decodes the clips in order.
+    pool = concurrent.futures.ThreadPoolExecutor(1)
 
     def call(latents, *args, **kwargs):
         path = f"/dev/shm/ltx2-frames-{os.getpid()}-{time.time_ns()}"
@@ -168,11 +173,15 @@ def split_decode(vae, group) -> None:
         # Once all the ranks map the file, its name can go: then the file cannot outlive a decode that fails.
         dist.barrier(group=group)
         os.unlink(path)
-        write_frames(decode(latents, *args, **kwargs), vae, latents, frames)
-        # The other ranks have written their frames once they all answer.
-        dist.gather_object(None, [None] * dist.get_world_size(group), dst=0, group=group)
-        # Copied out of shared memory, which the frames of the shots of a long film would fill.
-        return (frames.clone(),)
+
+        def finish():
+            write_frames(decode(latents, *args, **kwargs), vae, latents, frames)
+            # The other ranks have written their frames once they all answer.
+            dist.gather_object(None, [None] * dist.get_world_size(group), dst=0, group=group)
+            # Copied out of shared memory, which the frames of the shots of a long film would fill.
+            return frames.clone()
+
+        return (pool.submit(finish),)
 
     vae.decode = call
 
@@ -498,7 +507,8 @@ def generate(
         if end is not None:
             settings["conditions"].append(LTX2VideoCondition(frames=end, index=keyframe_index(num_frames, len(end))))
     if upsample_pipe is None:
-        return pipe(width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="pt", **settings)
+        video, audio = pipe(width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="pt", **settings)
+        return frames_of(video), audio
     t0 = time.time()
     latents, audio_latents = pipe(
         width=width, height=height, sigmas=DISTILLED_SIGMA_VALUES, output_type="latent", **settings
@@ -520,8 +530,16 @@ def generate(
         output_type="pt",
         **settings,
     )
+    video = frames_of(video)
     log(f"stage 2: {time.time() - t0:.0f} s")
     return video, audio
+
+
+def frames_of(video):
+    """`video`, the frames that a pipeline returns, or on Neuron, the future of them (see `split_decode`)."""
+    import concurrent.futures
+
+    return video.result() if isinstance(video, concurrent.futures.Future) else video
 
 
 def write_mp4(path: str, frames, audio, sample_rate: int) -> None:
