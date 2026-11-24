@@ -700,12 +700,13 @@ def main() -> None:
                         "the model card")
     parser.add_argument("--tp", type=int, default=TP, help="the number of NeuronCores the weights are split over")
     parser.add_argument("--sp", type=int, help="the number of groups of --tp NeuronCores that split the video tokens "
-                        "(default: 4 with --two-stage, else 1)")
+                        "(default: 8 with --two-stage, else 1)")
     args = parser.parse_args()
     shots = read_film(args.film, args.frames) if args.film else [{"prompt": prompt} for prompt in args.prompt]
     order = generation_order(shots)
-    # Split over 4 cores only, the block graph of the second stage fails to load.
-    args.sp = args.sp or (4 if args.two_stage else 1)
+    # Split over 4 cores only, the block graph of the second stage fails to load. Over 8 groups of 4 cores, the 32 cores
+    # of 8 chips, a step of the second stage took 3.0 s, against 4.9 s over 4 groups.
+    args.sp = args.sp or (8 if args.two_stage else 1)
     if args.cpu:
         # Keeps torch from loading torch-neuronx: this run takes no NeuronCore.
         os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
