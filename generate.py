@@ -97,7 +97,10 @@ def decode_on_neuron(vae):
     import torch
 
     device = f"neuron:{torch.neuron.current_device()}"
-    # Split by frames, the decoder exchanges frames with the other ranks between its compiled graphs.
+    # Split by frames, the decoder exchanges frames with the other ranks between its compiled graphs. dynamo compiles
+    # the convolution after each exchange once per shape of its input, for more shapes than its default limit of 8,
+    # past which it runs the convolutions op by op.
+    torch._dynamo.config.recompile_limit = 64
     vae.decoder.compile(backend="neuron", fullgraph=False, dynamic=False)
     decode = vae.decode
 
