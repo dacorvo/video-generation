@@ -306,6 +306,37 @@ def load_models(sp: int = 1):
     return transformer, vae, dist.new_group(backend="gloo"), sp_group
 
 
+def share_cpus(group) -> None:
+    """Moves the threads of rank 0 to the CPUs that no other rank of the gloo group `group` runs on, if there are any,
+    and gives each other rank as many threads of torch as its share of the CPUs it runs on.
+
+    Each rank runs on the CPUs of the NUMA node of its NeuronCore, with as many threads of torch as the node has CPUs,
+    and keeps one of them busy, even idle. On the 8 chips of one node, rank 0, which runs the pipeline and its models
+    on CPU, shared the CPUs of that node with 31 other ranks: its text encoder took 7.4 s, against 3.3 s with 15 other
+    ranks. With all those threads, the 31 ranks also took 0.9 s for each step of the first stage, against 0.6 s with
+    their share.
+    """
+    import torch
+    import torch.distributed as dist
+
+    cpus = [None] * dist.get_world_size(group)
+    dist.all_gather_object(cpus, os.sched_getaffinity(0), group=group)
+    rank = dist.get_rank(group)
+    if rank != 0:
+        torch.set_num_threads(max(1, len(cpus[rank]) // cpus[1:].count(cpus[rank])))
+        return
+    free = set(range(os.cpu_count())) - set().union(*cpus[1:])
+    if not free:
+        return
+    for thread in os.listdir("/proc/self/task"):
+        try:
+            os.sched_setaffinity(int(thread), free)
+        except ProcessLookupError:
+            # The thread ended.
+            pass
+    log(f"rank 0 runs on the {len(free)} CPUs that no other rank runs on")
+
+
 def on_host(pipeline_class):
     """The diffusers pipeline class `pipeline_class`, made to run on the host."""
     import torch
@@ -688,6 +719,8 @@ def main() -> None:
     transformer = vae = group = sp_group = None
     if not args.cpu:
         transformer, vae, group, sp_group = load_models(args.sp)
+        # Before rank 0 loads the models it runs on CPU, so that their memory is on the node of its new CPUs.
+        share_cpus(group)
         if RANK != 0:
             serve(transformer, vae, group, sp_group)
             return
