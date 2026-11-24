@@ -3,6 +3,10 @@
 Generates video with audio with [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5-Diffusers)
 on a trn3.48xlarge, its transformer split over the NeuronCores.
 
+It makes two kinds of clips: [films](#films), whose shots follow one another,
+and [continuations](#continuations), clips that go on from a frame of a real
+camera, as training videos for robots, cars and drones.
+
 ## Setup
 
 The demo keeps its venv, the weights and the compiled graphs in a working
@@ -32,31 +36,39 @@ With `--two-stage`, [`generate.py`](generate.py) follows the two-stage recipe of
 the model card: 8 steps at 1024x512, the x2 latent upsampler on CPU, then 3
 steps at 2048x1024.
 
-[`generate.py`](generate.py) writes the clip to `outputs/`, named after the
-demo and its size, such as `video-gen-demo-2048x1024`: an mp4 with its audio, 4
-of its frames as a png and, with `--npz`, its frames and audio as an npz.
-`--prompt` and `--seed` set what it generates. With several prompts, it makes
-one clip per prompt, one after the other, without loading the models again:
-their names end with `-1`, `-2`...
+What [`generate.py`](generate.py) generates is a JSON file, a list of shots,
+each with a name and a prompt: a [film](#films), or
+[continuations](#continuations) of a frame. Without a file, it makes one shot
+of a red fox. It makes the shots one after the other, without loading the
+models again. `--seed` sets the seed of the shots that have none.
+
+It writes each clip to `outputs/`, named after the file and the size of the
+clip, such as `goat-2048x1024`, or `video-gen-demo-2048x1024` without a file:
+an mp4 with its audio, 4 of its frames as a png and, with `--npz`, its frames
+and audio as an npz. With several shots, the name of each clip ends with the
+name of its shot, such as `goat-2048x1024-climb`, and the clip that ends with
+`-full` is the film of the shots, one after the other.
+
+Each shot refers to the others by their names, so that shots can be moved,
+added or removed by hand without the others pointing at the wrong shot.
 
 ## Films
 
-With `--film`, [`generate.py`](generate.py) makes the shots of a film in the
-same process, then the film, its shots edited one after the other. The films
-made with it, their JSON files and their mp4s, are in the
+A film is a file of shots that follow one another. The films made with
+[`generate.py`](generate.py), their JSON files and their mp4s, are in the
 [dacorvo/video-generation](https://huggingface.co/buckets/dacorvo/video-generation)
 bucket. For instance, for the goat film:
 
 ```bash
 curl -LO https://huggingface.co/buckets/dacorvo/video-generation/resolve/goat.json
-./run.sh generate.py --two-stage --film goat.json  # outputs/goat-2048x1024-full.mp4, and its shots goat-2048x1024-shot-1.mp4...
+./run.sh generate.py --two-stage goat.json  # outputs/goat-2048x1024-full.mp4, and its shots goat-2048x1024-valley.mp4...
 ```
 
-A film is a JSON list of shots, each a prompt. A shot can start from the last
-frames of an earlier shot, which it keeps as its first frames:
+A shot can start from the last frames of an earlier shot, which it keeps as its
+first frames:
 
 ```json
-{"prompt": "...", "from": {"shot": 2, "frames": 1}}
+{"name": "lake", "prompt": "...", "from": {"shot": "edge", "frames": 1}}
 ```
 
 - From the last frame of a shot, a shot returns to its subject after a cut,
@@ -68,28 +80,28 @@ takes as keyframes, so that the shot leads into it. The process then makes the
 later shot first:
 
 ```json
-{"prompt": "...", "to": {"shot": 3, "frames": 25}}
+{"name": "climb", "prompt": "...", "to": {"shot": "scream", "frames": 9}}
 ```
 
 A shot can have its own seed, in place of `--seed`, to keep the take of the shot
 picked among several:
 
 ```json
-{"prompt": "...", "seed": 3}
+{"name": "valley", "prompt": "...", "seed": 3}
 ```
 
 A shot can have a caption, drawn on its frames from `start` to `end`, in seconds
 into the shot:
 
 ```json
-{"prompt": "...", "caption": {"text": "GOOOAAAATTT", "start": 4.4, "end": 6.4}}
+{"name": "scream", "prompt": "...", "caption": {"text": "GOOOAAAATTT", "start": 4.4, "end": 6.4}}
 ```
 
 A shot can be trimmed to the time range from `start` to `end`, in seconds into
 the shot, as all shots come out the same length:
 
 ```json
-{"prompt": "...", "trim": {"start": 3.0, "end": 6.5}}
+{"name": "eye", "prompt": "...", "trim": {"start": 4.5, "end": 8.0}}
 ```
 
 The number of frames is one more than a multiple of 8, as the VAE encodes the
@@ -100,10 +112,43 @@ each shot on its own, the background of one shot can be faint and the next one
 loud: the film raises its quiet parts toward a common level, and leaves its
 loud sounds as they are.
 
-In the bucket, in `fox.json`, shot 2 continues shot 1, shot 3 cuts to a raven,
-and shot 4 returns to the fox from the last frame of shot 2. In `goat.json`,
-the climb ends on the first frames of the scream, the eye is an insert of 3.5 s
-trimmed from its shot, and the scream has a caption.
+In the bucket, in `fox.json`, `edge` continues `trot`, `raven` cuts to a
+raven, and `lake` returns to the fox from the last frame of `edge`. In
+`goat.json`, `climb` ends on the first frames of `scream`, `eye` is an insert
+of 3.5 s trimmed from its shot, and `scream` has a caption.
+
+## Continuations
+
+Robots, cars and drones learn from video of what their cameras see. A world
+model makes more of it: from a frame of a camera, it generates what the camera
+may see next, including the rare cases that are costly or dangerous to film,
+such as a deer jumping onto a snowy road. LTX calls LTX-2.5 a world model.
+
+A shot can start from an image, such as a frame of a camera, which it keeps as
+its first frame, and its prompt says what happens next. The path of the image
+is relative to the JSON file. Several shots can start from the same frame, each
+with its own future, such as what happened and a rare case:
+
+```json
+[
+  {"name": "happened", "prompt": "...", "from": {"image": "boreas-snow.png"}},
+  {"name": "deer", "prompt": "...", "from": {"image": "boreas-snow.png"}}
+]
+```
+
+```bash
+./run.sh generate.py --two-stage boreas-snow.json  # outputs/boreas-snow-2048x1024-happened.mp4 and -deer.mp4, and -full.mp4, both one after the other
+```
+
+The pipeline scales the image to cover the clip and keeps its middle: a frame
+of another shape loses its sides, or its top and bottom.
+
+Here the prompt drives the clip, not the commands of a robot or a car, which a
+world model for training follows. To build one, a team fine-tunes the
+[pre-trained checkpoint of LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5-Pre-Trained)
+on the frames and actions of its own robots: LTX calls that checkpoint "a
+foundation to build from, not an out-of-the-box robotics or autonomous-driving
+system" ([LTX](https://ltx.io/model/capabilities/world-model)).
 
 ## Checks
 

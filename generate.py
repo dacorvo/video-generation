@@ -1,4 +1,4 @@
-"""Generates a clip with its audio with LTX-2.5, its transformer split over NeuronCores, or all on CPU.
+"""Generates clips with their audio with LTX-2.5, its transformer split over NeuronCores, or all on CPU.
 
 The distilled pipeline of models/LTX-2.5-Diffusers generates in one stage, with the settings of its model card. With
 --two-stage, it follows the two-stage recipe of the model card: it generates the clip at --width x --height as
@@ -10,23 +10,24 @@ and the decoder runs on the last 16 of their cores. Only rank 0 runs the pipelin
 arguments of each transformer call and of the decode to the other ranks, which run their slices of the transformer on
 them and decode their frames into shared memory, where rank 0 reads them. With --cpu, the whole pipeline runs on CPU.
 
-The clip goes to outputs/NAME.mp4, 4 of its frames to outputs/NAME.png and, with --npz, its frames and audio to
-outputs/NAME.npz.
-NAME is video-gen-demo-WIDTHxHEIGHT by default, after the size of the clip, with -cpu on CPU. With several prompts,
-the process makes one clip per prompt, one after the other, and their names end with -1, -2...
+What to generate is a JSON file of shots, each with a name and a prompt (see read_shots), which the process makes one
+after the other. A shot can start from an image, such as a frame of the camera of a robot or of a car, which the
+condition pipeline of diffusers keeps as its first frame: the prompt says what happens next. A shot can also start from
+the last frames of an earlier shot, which the condition pipeline keeps as its first frames. From the last frame of a
+shot, it returns to its subject after a cut. From its last second, it continues its motion. A shot can also end on the
+first frames of a later shot, which the condition pipeline takes as keyframes: it then leads into that shot, which the
+process makes first. Without a file, the process makes one shot of a red fox.
+
+Each clip goes to outputs/, as an mp4 with its audio, 4 of its frames as a png and, with --npz, its frames and audio as
+an npz. With one shot, the clip is NAME. With several, each shot is NAME-SHOT, after its name, and the film, NAME-full,
+is the shots one after the other. The film leaves out the frames a shot starts from when they repeat an earlier shot,
+and those of a shot from its keyframes on, which the later shot repeats. NAME is FILE-WIDTHxHEIGHT by default, after
+the JSON file, or video-gen-demo-WIDTHxHEIGHT without one, with -cpu on CPU.
 outputs/ is in the repository, and models/ in the working directory of the demo, `launch.WORK_DIR`.
 
-With --film, the process makes the shots of a film, NAME-shot-1, NAME-shot-2..., then the film, NAME-full, its shots
-one after the other. A shot can start from the last frames of an earlier shot, which the condition pipeline of diffusers
-keeps as its first frames. From the last frame of a shot, it returns to its subject after a cut. From its last second,
-it continues its motion. A shot can also end on the first frames of a later shot, which the condition pipeline takes as
-keyframes: it then leads into that shot, which the process makes first. The film leaves out the frames a shot starts
-from, which repeat the earlier shot, and those of a shot from its keyframes on, which the later shot repeats. NAME is
-FILM-WIDTHxHEIGHT by default, after the file of the film.
-
 Run with:
-    ./run.sh generate.py [--cpu] [--prompt PROMPT... | --film FILM] [--seed SEED] [--name NAME] [--width WIDTH]
-        [--height HEIGHT] [--frames FRAMES] [--two-stage] [--tp TP] [--sp SP] [--npz]
+    ./run.sh generate.py [--cpu] [--seed SEED] [--name NAME] [--width WIDTH] [--height HEIGHT] [--frames FRAMES]
+        [--two-stage] [--tp TP] [--sp SP] [--npz] [FILE]
 """
 from __future__ import annotations
 
@@ -612,55 +613,87 @@ def save(frames, audio, sample_rate: int, name: str, npz: bool = False):
     return writer
 
 
-def read_film(path: str, num_frames: int) -> list[dict]:
-    """The shots of the film of the JSON file `path`, a list of shots of `num_frames` frames. Each has a "prompt", can
-    start from the last frames of an earlier shot, {"from": {"shot": NUMBER, "frames": COUNT}}, which it then keeps as
-    its first frames, and can end on the first frames of a later shot, {"to": {"shot": NUMBER, "frames": COUNT}}. As the
+def read_shots(path: str, num_frames: int) -> list[dict]:
+    """The shots of the JSON file `path`, a list of shots of `num_frames` frames. Each has a "name", which ends the names
+    of its outputs and by which other shots refer to it, and a "prompt". It can start from an image, {"from": {"image":
+    FILE}}, which it then keeps as its first frame, or from the last frames of an earlier shot, {"from": {"shot": NAME,
+    "frames": COUNT}}, which it then keeps as its first frames, and can end on the first frames of a later shot, {"to":
+    {"shot": NAME, "frames": COUNT}}. FILE is relative to the directory of `path`, and comes back joined to it. As the
     VAE encodes the frames after the first by 8, COUNT is one more than a multiple of 8. A shot can also have its own
-    "seed", in place of the seed of the film."""
+    "seed", in place of the seed of the process."""
     import json
+    import re
 
     with open(path) as f:
         shots = json.load(f)
     if not shots:
-        raise SystemExit(f"{path}: the film has no shot")
-    for number, shot in enumerate(shots, 1):
-        start, end = shot.get("from"), shot.get("to")
-        if start is not None and not (
-            1 <= start["shot"] < number and 1 <= start["frames"] <= num_frames and start["frames"] % 8 == 1
+        raise SystemExit(f"{path}: the file has no shot")
+    names = [shot.get("name") for shot in shots]
+    for name in names:
+        # NAME-full is the film.
+        if not isinstance(name, str) or not re.fullmatch(r"[\w-]+", name) or name == "full":
+            raise SystemExit(
+                f"{path}: each shot needs a name of letters, digits, - and _, other than full, not {name!r}"
+            )
+        if names.count(name) > 1:
+            raise SystemExit(f"{path}: several shots are named {name}")
+    position = {name: i for i, name in enumerate(names)}
+    for i, shot in enumerate(shots):
+        name, start, end = shot["name"], shot.get("from"), shot.get("to")
+        if start is not None and "image" in start:
+            if not isinstance(start["image"], str):
+                raise SystemExit(f"{path}: the image of shot {name} is not a path")
+            start["image"] = os.path.join(os.path.dirname(path), start["image"])
+            if not os.path.isfile(start["image"]):
+                raise SystemExit(f"{path}: shot {name} starts from {start['image']}, which is not a file")
+        elif start is not None and not (
+            position.get(start.get("shot"), i) < i
+            and isinstance(start.get("frames"), int)
+            and 1 <= start["frames"] <= num_frames
+            and start["frames"] % 8 == 1
         ):
-            raise SystemExit(f"{path}: shot {number} can only start from the last 1, 9, 17... frames of an earlier shot")
+            raise SystemExit(
+                f"{path}: shot {name} can only start from an image or from the last 1, 9, 17... frames of an earlier "
+                f"shot, not {start}"
+            )
         # The keyframes start after the first latent of the clip.
         if end is not None and not (
-            number < end["shot"] <= len(shots) and 1 <= end["frames"] <= num_frames - 8 and end["frames"] % 8 == 1
+            i < position.get(end.get("shot"), i)
+            and isinstance(end.get("frames"), int)
+            and 1 <= end["frames"] <= num_frames - 8
+            and end["frames"] % 8 == 1
         ):
-            raise SystemExit(f"{path}: shot {number} can only end on the first 1, 9, 17... frames of a later shot")
+            raise SystemExit(
+                f"{path}: shot {name} can only end on the first 1, 9, 17... frames of a later shot, not {end}"
+            )
         if not isinstance(shot.get("seed", 0), int):
-            raise SystemExit(f"{path}: the seed of shot {number} is not an integer")
+            raise SystemExit(f"{path}: the seed of shot {name} is not an integer")
         caption = shot.get("caption")
         if caption is not None and not (
             isinstance(caption.get("text"), str)
             and caption["text"]
             and 0 <= caption.get("start", -1) < caption.get("end", -1) <= num_frames / FPS
         ):
-            raise SystemExit(f"{path}: the caption of shot {number} needs a text, a start and an end within the shot")
+            raise SystemExit(f"{path}: the caption of shot {name} needs a text, a start and an end within the shot")
         trim = shot.get("trim")
         if trim is not None and not (0 <= trim.get("start", -1) < trim.get("end", -1) <= num_frames / FPS):
-            raise SystemExit(f"{path}: the trim of shot {number} needs a start and an end within the shot")
+            raise SystemExit(f"{path}: the trim of shot {name} needs a start and an end within the shot")
     return shots
 
 
 def generation_order(shots: list[dict]) -> list[int]:
     """The indices of `shots` in an order that makes each shot after those it starts from or ends on."""
+    position = {shot["name"]: i for i, shot in enumerate(shots)}
     order = []
     while len(order) < len(shots):
         ready = [
             i
             for i, shot in enumerate(shots)
-            if i not in order and all(shot[key]["shot"] - 1 in order for key in ("from", "to") if key in shot)
+            if i not in order
+            and all(position[shot[key]["shot"]] in order for key in ("from", "to") if "shot" in shot.get(key, {}))
         ]
         if not ready:
-            raise SystemExit("the film has shots that start from or end on each other")
+            raise SystemExit("the file has shots that start from or end on each other")
         order.append(ready[0])
     return order
 
@@ -702,7 +735,7 @@ def level_audio(audio, sample_rate: int):
 
 def edit_film(clips: list, shots: list[dict], sample_rate: int):
     """The frames and audio of the film of `shots`, of which `clips` holds the frames and audio: its shots one after the
-    other, each without the frames it starts from, which repeat those of an earlier shot, and without its frames from
+    other, each without the frames it starts from when they repeat those of an earlier shot, and without its frames from
     the keyframes it ends on, which a later shot repeats. A shot can be trimmed to a time range, and have a caption,
     drawn on its frames from its start to its end, both in seconds into the shot. Its sound has the background of its
     shots evened out (see `level_audio`)."""
@@ -730,19 +763,17 @@ def edit_film(clips: list, shots: list[dict], sample_rate: int):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generates a clip with LTX-2.5, on Neuron or on CPU.")
+    parser = argparse.ArgumentParser(description="Generates clips with LTX-2.5, on Neuron or on CPU.")
+    parser.add_argument("file", nargs="?", help="a JSON file of shots, each with a name and a prompt, which can start "
+                        "from an image or from an earlier shot (see read_shots): the shots, made one after the other, "
+                        "then, with several, the film (default: one shot of a red fox)")
     parser.add_argument("--cpu", action="store_true", help="run the whole pipeline on CPU")
-    content = parser.add_mutually_exclusive_group()
-    content.add_argument("--prompt", nargs="+", default=[PROMPT], help="one clip per prompt, made one after the other")
-    content.add_argument("--film", help="a JSON file of the shots of a film, which can start from the last frames of "
-                         "an earlier shot (see read_film): the shots, made one after the other, then the film")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--npz", action="store_true", help="also write the frames and audio of each clip to "
                         "NAME.npz")
-    parser.add_argument("--name", help="the name of the outputs (default: video-gen-demo-WIDTHxHEIGHT, after the size "
-                        "of the clip, or FILM-WIDTHxHEIGHT with --film, after its file, with -cpu on CPU), followed by "
-                        "-1, -2... for each of several clips, or by -shot-1, -shot-2... for the shots of a film and "
-                        "-full for the film")
+    parser.add_argument("--name", help="the name of the outputs (default: FILE-WIDTHxHEIGHT, after the JSON file, or "
+                        "video-gen-demo-WIDTHxHEIGHT without one, with -cpu on CPU), followed, with several shots, by "
+                        "-SHOT for each shot, after its name, and by -full for the film")
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--frames", type=int, default=NUM_FRAMES, help="one more than a multiple of 8")
@@ -752,7 +783,7 @@ def main() -> None:
     parser.add_argument("--sp", type=int, help="the number of groups of --tp NeuronCores that split the video tokens "
                         "(default: 8 with --two-stage, else 1)")
     args = parser.parse_args()
-    shots = read_film(args.film, args.frames) if args.film else [{"prompt": prompt} for prompt in args.prompt]
+    shots = read_shots(args.file, args.frames) if args.file else [{"name": "fox", "prompt": PROMPT}]
     order = generation_order(shots)
     # Split over 4 cores only, the block graph of the second stage fails to load. Over 8 groups of 4 cores, the 32 cores
     # of 8 chips, a step of the second stage took 3.0 s, against 4.9 s over 4 groups.
@@ -781,8 +812,8 @@ def main() -> None:
     condition_pipe = load_condition_pipeline(pipe) if conditioned else None
     log(f"load: {time.time() - t0:.0f} s")
     sample_rate = pipe.vocoder.config.output_sampling_rate
-    # The frames, in uint8 RGB, and the audio of each clip, once made.
-    clips = [None] * len(shots)
+    # The frames, in uint8 RGB, and the audio of each clip once made, by the name of its shot.
+    clips = {}
     # The threads that write the png and npz of the clips.
     writers = []
     for i in order:
@@ -790,14 +821,22 @@ def main() -> None:
         calls.clear()
         t0 = time.time()
         start = end = None
-        if "from" in shot:
+        if "image" in shot.get("from", {}):
+            import numpy as np
+            from PIL import Image
+
+            log(f"shot {shot['name']}: starts from {shot['from']['image']}")
+            # In uint8 RGB, as the frames of a clip: the condition pipeline scales the image to cover each stage and
+            # crops its middle.
+            start = np.asarray(Image.open(shot["from"]["image"]).convert("RGB"))[None]
+        elif "from" in shot:
             source, count = shot["from"]["shot"], shot["from"]["frames"]
-            log(f"shot {i + 1}: starts from the last {count} frames of shot {source}")
-            start = clips[source - 1][0][-count:]
+            log(f"shot {shot['name']}: starts from the last {count} frames of shot {source}")
+            start = clips[source][0][-count:]
         if "to" in shot:
             target, count = shot["to"]["shot"], shot["to"]["frames"]
-            log(f"shot {i + 1}: ends on the first {count} frames of shot {target}")
-            end = clips[target - 1][0][:count]
+            log(f"shot {shot['name']}: ends on the first {count} frames of shot {target}")
+            end = clips[target][0][:count]
         video, audio = generate(
             pipe if start is None and end is None else condition_pipe,
             shot["prompt"],
@@ -816,19 +855,17 @@ def main() -> None:
             dist.broadcast_object_list([None], src=0, group=group)
         log(f"generation: {time.time() - t0:.0f} s, transformer calls: {', '.join(f'{c:.1f}' for c in calls)} s")
         frames = video[0].numpy()
-        clips[i] = (frames, audio[0].float().cpu().numpy())
+        clips[shot["name"]] = (frames, audio[0].float().cpu().numpy())
         height, width = frames.shape[1:3]
-        stem = os.path.splitext(os.path.basename(args.film))[0] if args.film else "video-gen-demo"
+        stem = os.path.splitext(os.path.basename(args.file))[0] if args.file else "video-gen-demo"
         name = args.name or f"{stem}-{width}x{height}" + ("-cpu" if args.cpu else "")
-        if args.film:
-            clip_name = f"{name}-shot-{i + 1}"
-        else:
-            clip_name = f"{name}-{i + 1}" if len(shots) > 1 else name
-        writers.append(save(*clips[i], sample_rate, clip_name, npz=args.npz))
+        clip_name = f"{name}-{shot['name']}" if len(shots) > 1 else name
+        writers.append(save(*clips[shot["name"]], sample_rate, clip_name, npz=args.npz))
         log(f"wrote {os.path.join(OUTPUT_DIR, clip_name)}.mp4, {time.time() - t0:.0f} s after the start of the clip")
-    if args.film:
+    if len(shots) > 1:
         t0 = time.time()
-        writers.append(save(*edit_film(clips, shots, sample_rate), sample_rate, f"{name}-full"))
+        film = edit_film([clips[shot["name"]] for shot in shots], shots, sample_rate)
+        writers.append(save(*film, sample_rate, f"{name}-full"))
         log(f"wrote {os.path.join(OUTPUT_DIR, name)}-full.mp4, the film, in {time.time() - t0:.0f} s")
     for writer in writers:
         writer.join()
