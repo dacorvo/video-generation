@@ -415,7 +415,13 @@ def load_pipeline(calls: list, transformer=None, vae=None, group=None, sp_group=
 
 
 def load_upsampler(pipe):
-    """The x2 latent upsampler of LTX-2.5 in bf16, on the host, as a pipeline that upscales the latents of `pipe`."""
+    """The x2 latent upsampler of LTX-2.5 in bf16, on the host, as a pipeline that upscales the latents of `pipe`.
+
+    It takes 2.0 s on CPU. Compiled for a NeuronCore in bf16, its GroupNorms returned values unrelated to those of CPU
+    on inputs of a large mean, which left a grid on the frames. With them in fp32, it took 1.0 s on a core of its own,
+    but the runtime could not load it on the core of rank 0 next to its slice of the transformer, with or without the
+    decoder there.
+    """
     import torch
     from diffusers import LTX2LatentUpsamplePipeline, LTX2LatentUpsamplerModel
 
