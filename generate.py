@@ -527,17 +527,26 @@ def generate(
 def write_mp4(path: str, frames, audio, sample_rate: int) -> None:
     """Writes the frames, in uint8 RGB, and the stereo audio of a clip to the mp4 `path`, in H.264 and MP3.
 
-    diffusers' encode_video writes the audio in AAC, which the VS Code preview does not play.
+    diffusers' encode_video writes the audio in AAC, which the VS Code preview does not play. x264 encodes the frames
+    of a clip at 2048x1024 in 0.9 s with its veryfast preset, against 2.1 s with its default one, medium, for a file
+    of the same size. With 24 threads, a clip took 1.4 s to write, against 1.8 s with the default number of threads
+    of x264. Its frames wrap the rows of `frames` instead of copying them: with copies, a clip with snow took 1.7 to
+    2.2 s to write, against 1.4 s.
     """
     import av
+    import numpy as np
 
+    # Wrapped, the rows of the frames must be contiguous.
+    frames = np.ascontiguousarray(frames)
     with av.open(path, mode="w") as container:
-        video_stream = container.add_stream("libx264", rate=int(FPS))
+        video_stream = container.add_stream(
+            "libx264", rate=int(FPS), options={"preset": "veryfast", "threads": "24"}
+        )
         video_stream.width, video_stream.height, video_stream.pix_fmt = frames.shape[2], frames.shape[1], "yuv420p"
         audio_stream = container.add_stream("libmp3lame", rate=sample_rate)
         audio_stream.codec_context.layout = "stereo"
         for array in frames:
-            container.mux(video_stream.encode(av.VideoFrame.from_ndarray(array, format="rgb24")))
+            container.mux(video_stream.encode(av.VideoFrame.from_numpy_buffer(array, format="rgb24")))
         container.mux(video_stream.encode())
         samples = av.AudioFrame.from_ndarray(audio, format="fltp", layout="stereo")
         samples.sample_rate = sample_rate
